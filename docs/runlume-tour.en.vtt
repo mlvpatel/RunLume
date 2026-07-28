@@ -1,0 +1,22 @@
+WEBVTT
+
+00:00:00.000 --> 00:00:04.000
+Meet RunLume, a local-first dashboard for AI coding sessions.
+
+00:00:04.000 --> 00:00:08.000
+This is the real application using synthetic data; no personal transcript is included.
+
+00:00:08.000 --> 00:00:12.000
+The live overview shows token flow, cost coverage, code impact, and tool reliability.
+
+00:00:12.000 --> 00:00:17.000
+Verified rates power cost estimates, while unknown models stay unpriced.
+
+00:00:17.000 --> 00:00:22.000
+Provider comparison separates sources from Nemotron, Kimi K3, GLM 5.2, Qwen 3.6, and Mistral.
+
+00:00:22.000 --> 00:00:25.500
+Successful tool results drive workflow metrics.
+
+00:00:25.500 --> 00:00:29.600
+Trajectories are redacted by default, and everything stays on localhost without telemetry.

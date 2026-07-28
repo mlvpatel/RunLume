@@ -1,0 +1,974 @@
+#!/usr/bin/env node
+/**
+ * RunLume: read-only analysis of local agent transcripts.
+ *
+ * Usage:
+ *   node server.mjs
+ *   node server.mjs --sources claude-code,codex
+ *   node server.mjs --days 90 | --all
+ *   node server.mjs --pricing ./rates.json
+ *   node server.mjs --port 5000
+ */
+import crypto from 'node:crypto';
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { makeAdapters } from './adapters.mjs';
+import {
+  buildStats,
+  inferProvider,
+  sessionIntelligence,
+  sessionSummary,
+  validatePricing,
+} from './analytics.mjs';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PACKAGE = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
+const SOURCE_NAMES = new Set(['claude-code', 'cursor', 'codex', 'gemini', 'api-log', 'hermes']);
+const SNAPSHOT_TTL_MS = 1_000;
+const API_STRING_LIMIT = 100_000;
+const DEFAULT_EVENT_PAGE_LIMIT = 100;
+const MAX_EVENT_PAGE_LIMIT = 250;
+const MAX_WINDOW_DAYS = 3_650;
+const MAX_PRICING_FILE_BYTES = 2 * 1024 * 1024;
+export const DEFAULT_RESOURCE_LIMITS = Object.freeze({
+  maxFileBytes: 64 * 1024 * 1024,
+  maxFiles: 10_000,
+  maxTotalBytes: 640 * 1024 * 1024,
+  maxEvents: 1_000_000,
+  maxSessions: 10_000,
+  minRefreshMs: 2_000,
+});
+const STATIC_ROOT = path.join(__dirname, 'public');
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml; charset=utf-8',
+};
+
+export const HELP = `RunLume ${PACKAGE.version}
+
+Usage: node server.mjs [options]
+
+  --days <n>                activity window in days (1-3650); default: 30
+  --all                     include all discovered sessions
+  --sources <list>          claude-code,cursor,codex,gemini,api-log,hermes
+  --import-dir <path>       opt-in provider or local-model JSONL captures
+  --pricing <path>          custom per-model pricing JSON
+  --port <number>           localhost port; default: 4477
+  --help                    show this help
+  --version                 show the installed version
+
+Environment:
+  PORT, RUNLUME_IMPORT_DIR, RUNLUME_PRICING,
+  CLAUDE_CONFIG_DIR, CURSOR_STATE_DIR, CODEX_HOME,
+  GEMINI_STATE_DIR, GEMINI_CLI_HOME, HERMES_STATE_DIR,
+  RUNLUME_MAX_FILE_BYTES, RUNLUME_MAX_FILES, RUNLUME_MAX_TOTAL_BYTES,
+  RUNLUME_MAX_EVENTS, RUNLUME_MAX_SESSIONS, RUNLUME_MIN_REFRESH_MS
+`;
+
+function valueAfter(args, flag) {
+  const index = args.indexOf(flag);
+  if (index < 0) return null;
+  const value = args[index + 1];
+  if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+  return value;
+}
+
+function positiveIntegerEnv(env, name, fallback, { allowZero = false } = {}) {
+  if (env[name] == null || env[name] === '') return fallback;
+  const value = Number(env[name]);
+  const minimum = allowZero ? 0 : 1;
+  if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`${name} must be an integer of at least ${minimum}`);
+  return value;
+}
+
+export function parseConfig(args = process.argv.slice(2), env = process.env) {
+  const valueFlags = new Set(['--days', '--sources', '--import-dir', '--pricing', '--port']);
+  const booleanFlags = new Set(['--all', '--help', '--version']);
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (booleanFlags.has(arg)) continue;
+    if (!valueFlags.has(arg)) throw new Error(`unknown option: ${arg}`);
+    if (!args[index + 1] || args[index + 1].startsWith('--')) throw new Error(`${arg} requires a value`);
+    index++;
+  }
+  if (args.includes('--all') && args.includes('--days')) throw new Error('--all and --days cannot be used together');
+
+  const rawPort = valueAfter(args, '--port') ?? env.PORT ?? '4477';
+  const port = Number(rawPort);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error(`invalid port: ${rawPort}`);
+
+  const rawDays = valueAfter(args, '--days') ?? '30';
+  const days = args.includes('--all') ? Infinity : Number(rawDays);
+  if (
+    !args.includes('--all')
+    && (!Number.isSafeInteger(days) || days < 1 || days > MAX_WINDOW_DAYS)
+  ) {
+    throw new Error(`invalid day window: ${rawDays}; expected 1-${MAX_WINDOW_DAYS}`);
+  }
+
+  const rawImportDir = valueAfter(args, '--import-dir') ?? env.RUNLUME_IMPORT_DIR ?? null;
+  const importDir = rawImportDir ? path.resolve(rawImportDir) : null;
+  const rawSources = valueAfter(args, '--sources');
+  const sources = rawSources ? [...new Set(rawSources.split(',').map((source) => source.trim()).filter(Boolean))] : null;
+  const unknownSources = sources?.filter((source) => !SOURCE_NAMES.has(source)) ?? [];
+  if (unknownSources.length) throw new Error(`unknown source${unknownSources.length === 1 ? '' : 's'}: ${unknownSources.join(', ')}`);
+  if (sources?.includes('api-log') && !importDir) {
+    throw new Error('--sources api-log requires --import-dir or RUNLUME_IMPORT_DIR');
+  }
+
+  return {
+    port,
+    days,
+    importDir,
+    sources,
+    limits: {
+      maxFileBytes: positiveIntegerEnv(env, 'RUNLUME_MAX_FILE_BYTES', DEFAULT_RESOURCE_LIMITS.maxFileBytes),
+      maxFiles: positiveIntegerEnv(env, 'RUNLUME_MAX_FILES', DEFAULT_RESOURCE_LIMITS.maxFiles),
+      maxTotalBytes: positiveIntegerEnv(env, 'RUNLUME_MAX_TOTAL_BYTES', DEFAULT_RESOURCE_LIMITS.maxTotalBytes),
+      maxEvents: positiveIntegerEnv(env, 'RUNLUME_MAX_EVENTS', DEFAULT_RESOURCE_LIMITS.maxEvents),
+      maxSessions: positiveIntegerEnv(env, 'RUNLUME_MAX_SESSIONS', DEFAULT_RESOURCE_LIMITS.maxSessions),
+      minRefreshMs: positiveIntegerEnv(env, 'RUNLUME_MIN_REFRESH_MS', DEFAULT_RESOURCE_LIMITS.minRefreshMs, { allowZero: true }),
+    },
+    pricingFile: path.resolve(
+      valueAfter(args, '--pricing')
+      ?? env.RUNLUME_PRICING
+      ?? path.join(__dirname, 'pricing.json'),
+    ),
+  };
+}
+
+export function isAllowedHost(hostHeader, port) {
+  if (
+    typeof hostHeader !== 'string'
+    || !hostHeader
+    || /[\s\/@?#\\,]/.test(hostHeader)
+  ) return false;
+  try {
+    const parsed = new URL(`http://${hostHeader}`);
+    if (parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) return false;
+    const local = parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '[::1]';
+    const requestPort = parsed.port ? Number(parsed.port) : 80;
+    return local && (port === 0 || requestPort === port);
+  } catch {
+    return false;
+  }
+}
+
+export function isAllowedOrigin(origin, port) {
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    return parsed.protocol === 'http:'
+      && !parsed.username
+      && !parsed.password
+      && parsed.pathname === '/'
+      && !parsed.search
+      && !parsed.hash
+      && isAllowedHost(parsed.host, port);
+  } catch {
+    return false;
+  }
+}
+
+function securityHeaders(contentType, cacheControl = 'no-store') {
+  return {
+    'Content-Type': contentType,
+    'Cache-Control': cacheControl,
+    'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src-elem 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'none'; object-src 'none'; media-src 'none'; worker-src 'none'; manifest-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'X-Permitted-Cross-Domain-Policies': 'none',
+    'Cross-Origin-Opener-Policy': 'same-origin',
+    'Cross-Origin-Resource-Policy': 'same-origin',
+    'Origin-Agent-Cluster': '?1',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
+  };
+}
+
+function json(res, obj, status = 200, headOnly = false) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, {
+    ...securityHeaders('application/json; charset=utf-8'),
+    'Content-Length': Buffer.byteLength(body),
+  });
+  res.end(headOnly ? undefined : body);
+}
+
+function shortPath(value) {
+  const home = process.env.HOME;
+  return home && (value === home || value.startsWith(`${home}${path.sep}`))
+    ? `~${value.slice(home.length)}`
+    : value;
+}
+
+export function isRealPathWithin(root, target) {
+  try {
+    const realRoot = fs.realpathSync(root);
+    const realTarget = fs.realpathSync(target);
+    return realTarget === realRoot || realTarget.startsWith(`${realRoot}${path.sep}`);
+  } catch {
+    return false;
+  }
+}
+
+export function latestSessionMs(session) {
+  let latest = null;
+  const consider = (value) => {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed) && (latest == null || parsed > latest)) latest = parsed;
+  };
+  consider(session.startedAt);
+  consider(session.endedAt);
+  for (const event of session.events) consider(event.ts);
+  return latest;
+}
+
+function readPricingDocument(file) {
+  let descriptor = null;
+  try {
+    descriptor = fs.openSync(
+      file,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0),
+    );
+    const opened = fs.fstatSync(descriptor);
+    const named = fs.lstatSync(file);
+    if (!opened.isFile()) throw new Error('pricing path must be a regular file');
+    if (named.isSymbolicLink()) throw new Error('pricing file must not be a symbolic link');
+    if (
+      (named.dev !== 0 || opened.dev !== 0 || named.ino !== 0 || opened.ino !== 0)
+      && (named.dev !== opened.dev || named.ino !== opened.ino)
+    ) {
+      throw new Error('pricing file changed while it was being opened');
+    }
+    if (opened.size > MAX_PRICING_FILE_BYTES) {
+      throw new Error(`pricing file exceeds ${MAX_PRICING_FILE_BYTES} bytes`);
+    }
+    const text = fs.readFileSync(descriptor, 'utf8');
+    const completed = fs.fstatSync(descriptor);
+    if (
+      completed.size !== opened.size
+      || completed.mtimeMs !== opened.mtimeMs
+      || completed.ctimeMs !== opened.ctimeMs
+      || completed.ino !== opened.ino
+    ) {
+      throw new Error('pricing file changed while it was being read');
+    }
+    return { stat: completed, text };
+  } finally {
+    if (descriptor != null) fs.closeSync(descriptor);
+  }
+}
+
+function publicKey(session) {
+  const digest = crypto.createHash('sha256')
+    .update(String(session.source))
+    .update('\0')
+    .update(String(session.file))
+    .update('\0')
+    .update(String(session.id))
+    .digest('hex')
+    .slice(0, 24);
+  return `${session.source}:${digest}`;
+}
+
+function cloneForApi(value, depth = 0) {
+  if (typeof value === 'string') {
+    return value.length > API_STRING_LIMIT
+      ? `${value.slice(0, API_STRING_LIMIT)}\n… [truncated ${value.length - API_STRING_LIMIT} characters]`
+      : value;
+  }
+  if (value == null || typeof value !== 'object') return value;
+  if (depth >= 8) return '[maximum depth reached]';
+  if (Array.isArray(value)) {
+    const kept = value.slice(0, 250).map((item) => cloneForApi(item, depth + 1));
+    if (value.length > kept.length) kept.push(`… [truncated ${value.length - kept.length} items]`);
+    return kept;
+  }
+  return Object.fromEntries(
+    Object.entries(value).slice(0, 250).map(([key, item]) => [key, cloneForApi(item, depth + 1)]),
+  );
+}
+
+function redactedSessionId(session) {
+  return String(session.key ?? publicKey(session)).split(':').at(-1);
+}
+
+function redactedEvent(event) {
+  if (event.kind === 'tool') {
+    return {
+      kind: 'tool',
+      ts: event.ts,
+      tool: {
+        id: null,
+        name: event.tool.name,
+        args: { redacted: true },
+        result: event.tool.result == null ? null : '[redacted tool result]',
+        isError: Boolean(event.tool.isError),
+        resultTs: event.tool.resultTs,
+        ...(event.tool.confirmed === true ? { confirmed: true } : {}),
+        ...(event.tool.spawnTarget ? { spawnTarget: event.tool.spawnTarget } : {}),
+      },
+    };
+  }
+  const labels = {
+    user: '[redacted user message]',
+    assistant: '[redacted assistant message]',
+    thinking: '[redacted reasoning]',
+    meta: '[redacted event metadata]',
+  };
+  return { kind: event.kind, ts: event.ts, text: labels[event.kind] ?? '[redacted event]' };
+}
+
+function safeSessionSummary(session, pricing, revealSensitive = false, analysis = null) {
+  const summary = sessionSummary(session, pricing, false, analysis);
+  if (revealSensitive) return summary;
+  const id = redactedSessionId(session);
+  return {
+    ...summary,
+    id,
+    agent: 'local agent',
+    label: `Session ${id.slice(0, 8)}`,
+    intelligence: {
+      ...summary.intelligence,
+      files: summary.intelligence.files.map((file, index) => ({
+        ...file,
+        path: `File ${index + 1}`,
+      })),
+    },
+  };
+}
+
+export function sessionPageForApi(session, pricing, {
+  offset = 0,
+  limit = DEFAULT_EVENT_PAGE_LIMIT,
+  revealSensitive = false,
+  analysis = null,
+} = {}) {
+  const total = session.events.length;
+  const events = session.events
+    .slice(offset, offset + limit)
+    .map((event) => cloneForApi(revealSensitive ? event : redactedEvent(event)));
+  return {
+    ...safeSessionSummary(session, pricing, revealSensitive, analysis),
+    sensitiveContentRevealed: revealSensitive,
+    events,
+    page: {
+      offset,
+      limit,
+      total,
+      hasMore: offset + events.length < total,
+      nextOffset: offset + events.length < total ? offset + events.length : null,
+      previousOffset: offset > 0 ? Math.max(0, offset - limit) : null,
+    },
+  };
+}
+
+function redactedStats(stats) {
+  const safe = structuredClone(stats);
+  const directoryLabels = new Map();
+  safe.impact.files.forEach((file, index) => {
+    if (!directoryLabels.has(file.directory)) {
+      directoryLabels.set(file.directory, `Directory ${directoryLabels.size + 1}`);
+    }
+    file.path = `File ${index + 1}`;
+    file.directory = directoryLabels.get(file.directory);
+    delete file.project;
+  });
+  safe.impact.directories.forEach((directory, index) => {
+    directory.path = `Directory ${index + 1}`;
+    delete directory.project;
+  });
+  safe.impact.churnFiles = safe.impact.files.filter((file) => file.sessions > 1 || file.churn > 1);
+  safe.cost.sessions.forEach((session, index) => {
+    session.id = `session-${index + 1}`;
+    session.label = `Session ${index + 1}`;
+  });
+  if (safe.records.longestSession) {
+    safe.records.longestSession.id = 'redacted';
+    safe.records.longestSession.label = 'Redacted session';
+  }
+  return safe;
+}
+
+function apiSessionSummary(session) {
+  const id = redactedSessionId(session);
+  return {
+    key: session.key,
+    id,
+    source: session.source,
+    agent: 'local agent',
+    label: `Session ${id.slice(0, 8)}`,
+    model: session.model,
+    provider: inferProvider(session.model, session.source, session.provider),
+    runtime: session.runtime,
+    startedAt: session.startedAt,
+    endedAt: session.endedAt,
+    parent: session.parent,
+    children: session.children,
+    stats: session.stats,
+    eventCount: session.events.length,
+  };
+}
+
+function redactedDiagnostics(diagnostics) {
+  return {
+    ...diagnostics,
+    pricingError: diagnostics.pricingError
+      ? 'pricing table unavailable or invalid'
+      : null,
+  };
+}
+
+function redactedRoots(roots) {
+  return [...new Set(roots.map((root) => `${root.split(':', 1)[0]}: local transcript root`))];
+}
+
+export function isAuthorized(authorization, token) {
+  if (typeof authorization !== 'string' || typeof token !== 'string') return false;
+  const match = /^Bearer ([A-Za-z0-9_-]+)$/.exec(authorization);
+  if (!match) return false;
+  const supplied = Buffer.from(match[1]);
+  const expected = Buffer.from(token);
+  return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+}
+
+function paginationFrom(url) {
+  const parse = (name, fallback, { min, max }) => {
+    const value = url.searchParams.get(name);
+    if (value == null) return fallback;
+    if (!/^\d+$/.test(value)) return null;
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number >= min && number <= max ? number : null;
+  };
+  const offset = parse('offset', 0, { min: 0, max: Number.MAX_SAFE_INTEGER });
+  const limit = parse('limit', DEFAULT_EVENT_PAGE_LIMIT, { min: 1, max: MAX_EVENT_PAGE_LIMIT });
+  return offset == null || limit == null ? null : { offset, limit };
+}
+
+export function createDashboard({
+  config,
+  logger = console,
+  apiToken = crypto.randomBytes(32).toString('base64url'),
+} = {}) {
+  if (!config) throw new Error('createDashboard requires a validated config');
+  if (
+    config.days !== Infinity
+    && (!Number.isSafeInteger(config.days) || config.days < 1 || config.days > MAX_WINDOW_DAYS)
+  ) {
+    throw new Error(`createDashboard requires days to be 1-${MAX_WINDOW_DAYS} or Infinity`);
+  }
+  if (typeof apiToken !== 'string' || !/^[A-Za-z0-9_-]{32,}$/.test(apiToken)) {
+    throw new Error('createDashboard requires a high-entropy API token');
+  }
+  const limits = { ...DEFAULT_RESOURCE_LIMITS, ...(config.limits ?? {}) };
+  for (const name of ['maxFileBytes', 'maxFiles', 'maxTotalBytes', 'maxEvents', 'maxSessions']) {
+    if (!Number.isSafeInteger(limits[name]) || limits[name] < 1) {
+      throw new Error(`createDashboard requires ${name} to be a positive safe integer`);
+    }
+  }
+  if (!Number.isSafeInteger(limits.minRefreshMs) || limits.minRefreshMs < 0) {
+    throw new Error('createDashboard requires minRefreshMs to be a non-negative safe integer');
+  }
+  const adapters = makeAdapters({
+    hermesDir: config.hermesDir,
+    importDir: config.importDir,
+    sources: config.sources,
+    maxFileBytes: limits.maxFileBytes,
+  });
+  const fileCache = new Map();
+  let snapshot = null;
+  let pricingEntry = null;
+  let lastForcedRefreshAt = -Infinity;
+
+  function loadPricing() {
+    let stat;
+    try {
+      const opened = readPricingDocument(config.pricingFile);
+      stat = opened.stat;
+      if (
+        pricingEntry?.mtimeMs === stat.mtimeMs
+        && pricingEntry?.ctimeMs === stat.ctimeMs
+        && pricingEntry?.size === stat.size
+        && pricingEntry?.ino === stat.ino
+      ) return pricingEntry;
+      const candidate = JSON.parse(opened.text);
+      const issues = validatePricing(candidate);
+      if (issues.length) throw new Error(issues.join('; '));
+      pricingEntry = {
+        mtimeMs: stat.mtimeMs,
+        ctimeMs: stat.ctimeMs,
+        size: stat.size,
+        ino: stat.ino,
+        value: candidate,
+        error: null,
+      };
+    } catch (err) {
+      const next = {
+        mtimeMs: stat?.mtimeMs ?? null,
+        ctimeMs: stat?.ctimeMs ?? null,
+        size: stat?.size ?? null,
+        ino: stat?.ino ?? null,
+        value: null,
+        error: err instanceof Error ? err.message : String(err),
+      };
+      if (pricingEntry?.error !== next.error) logger.warn(`pricing disabled: ${next.error}`);
+      pricingEntry = next;
+    }
+    return pricingEntry;
+  }
+
+  function buildState() {
+    const now = Date.now();
+    const cutoff = Number.isFinite(config.days) ? now - config.days * 86_400_000 : -Infinity;
+    const sessions = [];
+    const roots = new Set();
+    const liveFiles = new Set();
+    const revisionParts = [];
+    let totalBytes = 0;
+    let totalEvents = 0;
+    const diagnostics = {
+      filesDiscovered: 0,
+      filesParsed: 0,
+      filesFromCache: 0,
+      filesUnreadable: 0,
+      filesTooLarge: 0,
+      filesRejectedSymlink: 0,
+      filesOutsideRoot: 0,
+      filesSkippedByteBudget: 0,
+      fileBudgetReached: false,
+      sessionBudgetReached: false,
+      eventBudgetReached: false,
+      sessionsSkippedEventBudget: 0,
+      bytesAccepted: 0,
+      eventsAccepted: 0,
+      malformedLines: 0,
+      invalidRows: 0,
+      orphanResults: 0,
+      invalidSessionIds: 0,
+      sessionsOutsideWindow: 0,
+      sessionsWithoutTimestamps: 0,
+      futureSessions: 0,
+      ambiguousSpawnLinks: 0,
+      cyclicSpawnLinks: 0,
+      adapterErrors: 0,
+      refreshThrottled: 0,
+      pricingError: null,
+    };
+
+    const pricing = loadPricing();
+    diagnostics.pricingError = pricing.error;
+    revisionParts.push(`pricing:${pricing.mtimeMs}:${pricing.ctimeMs}:${pricing.ino}:${pricing.size}:${pricing.error ?? ''}`);
+
+    scanAdapters:
+    for (const adapter of adapters) {
+      for (const desc of adapter.findFiles()) {
+        if (diagnostics.filesDiscovered >= limits.maxFiles) {
+          diagnostics.fileBudgetReached = true;
+          break scanAdapters;
+        }
+        diagnostics.filesDiscovered++;
+        let stat;
+        try {
+          stat = fs.lstatSync(desc.file);
+        } catch {
+          diagnostics.filesUnreadable++;
+          continue;
+        }
+        if (stat.isSymbolicLink()) {
+          diagnostics.filesRejectedSymlink++;
+          continue;
+        }
+        if (!stat.isFile()) {
+          diagnostics.filesUnreadable++;
+          continue;
+        }
+        const sourceRoot = desc.root ?? path.dirname(desc.file);
+        if (!isRealPathWithin(sourceRoot, desc.file)) {
+          diagnostics.filesOutsideRoot++;
+          continue;
+        }
+        if (stat.size > limits.maxFileBytes) {
+          diagnostics.filesTooLarge++;
+          continue;
+        }
+        if (totalBytes + stat.size > limits.maxTotalBytes) {
+          diagnostics.filesSkippedByteBudget++;
+          continue;
+        }
+        totalBytes += stat.size;
+        diagnostics.bytesAccepted = totalBytes;
+        liveFiles.add(desc.file);
+        roots.add(`${adapter.source}: ${shortPath(sourceRoot)}`);
+        revisionParts.push(`${adapter.source}:${desc.file}:${stat.dev}:${stat.ino}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`);
+        let entry = fileCache.get(desc.file);
+        if (
+          !entry
+          || entry.mtimeMs !== stat.mtimeMs
+          || entry.ctimeMs !== stat.ctimeMs
+          || entry.ino !== stat.ino
+          || entry.dev !== stat.dev
+          || entry.size !== stat.size
+          || entry.source !== adapter.source
+        ) {
+          try {
+            const result = adapter.parseFile(desc);
+            entry = {
+              source: adapter.source,
+              mtimeMs: stat.mtimeMs,
+              ctimeMs: stat.ctimeMs,
+              ino: stat.ino,
+              dev: stat.dev,
+              size: stat.size,
+              sessions: Array.isArray(result) ? result : result.sessions,
+              diagnostics: Array.isArray(result) ? null : result.diagnostics,
+            };
+            diagnostics.filesParsed++;
+          } catch (err) {
+            entry = {
+              source: adapter.source,
+              mtimeMs: stat.mtimeMs,
+              ctimeMs: stat.ctimeMs,
+              ino: stat.ino,
+              dev: stat.dev,
+              size: stat.size,
+              sessions: [],
+              diagnostics: { readError: err instanceof Error ? err.message : String(err) },
+            };
+            diagnostics.adapterErrors++;
+          }
+          fileCache.set(desc.file, entry);
+        } else {
+          diagnostics.filesFromCache++;
+        }
+
+        const fileDiagnostics = entry.diagnostics;
+        if (fileDiagnostics?.readError) diagnostics.filesUnreadable++;
+        if (fileDiagnostics?.tooLarge) diagnostics.filesTooLarge++;
+        diagnostics.malformedLines += fileDiagnostics?.malformedLines ?? 0;
+        diagnostics.invalidRows += fileDiagnostics?.invalidRows ?? 0;
+        diagnostics.orphanResults += fileDiagnostics?.orphanResults ?? 0;
+        diagnostics.invalidSessionIds += fileDiagnostics?.invalidSessionIds ?? 0;
+        diagnostics.filesRejectedSymlink += fileDiagnostics?.symlinkRejected ? 1 : 0;
+
+        for (const session of entry.sessions) {
+          if (sessions.length >= limits.maxSessions) {
+            diagnostics.sessionBudgetReached = true;
+            break scanAdapters;
+          }
+          if (typeof session.id !== 'string' || !session.id || session.id.length > 512) {
+            diagnostics.invalidSessionIds++;
+            continue;
+          }
+          const activity = latestSessionMs(session);
+          if (activity == null) {
+            diagnostics.sessionsWithoutTimestamps++;
+            if (Number.isFinite(config.days)) continue;
+          } else if (activity > now + 5 * 60_000) {
+            diagnostics.futureSessions++;
+            continue;
+          } else if (activity < cutoff) {
+            diagnostics.sessionsOutsideWindow++;
+            continue;
+          }
+          if (totalEvents + session.events.length > limits.maxEvents) {
+            diagnostics.eventBudgetReached = true;
+            diagnostics.sessionsSkippedEventBudget++;
+            continue;
+          }
+          session.key = publicKey(session);
+          sessions.push(session);
+          totalEvents += session.events.length;
+          diagnostics.eventsAccepted = totalEvents;
+        }
+      }
+    }
+    for (const file of fileCache.keys()) if (!liveFiles.has(file)) fileCache.delete(file);
+
+    const byKey = new Map(sessions.map((session) => [session.key, session]));
+    const relationshipScope = (session) => session.linkScope ?? session.file;
+    const byScopedId = new Map(sessions.map((session) => [
+      `${session.source}\0${relationshipScope(session)}\0${session.id.toLowerCase()}`,
+      session,
+    ]));
+    const byRawId = new Map();
+    for (const session of sessions) {
+      const raw = session.id.toLowerCase();
+      if (!byRawId.has(raw)) byRawId.set(raw, []);
+      byRawId.get(raw).push(session);
+      session.parent = null;
+      session.children = [];
+      for (const event of session.events) {
+        if (event.kind === 'tool') delete event.tool.spawnTarget;
+      }
+    }
+
+    const createsCycle = (parent, child) => {
+      for (let current = parent; current; current = current.parent ? byKey.get(current.parent) : null) {
+        if (current === child) return true;
+      }
+      return false;
+    };
+
+    for (const session of sessions) {
+      if (session.intrinsicParent) {
+        const parentId = typeof session.intrinsicParent === 'string' ? session.intrinsicParent.toLowerCase() : null;
+        const parent = parentId
+          ? byScopedId.get(`${session.source}\0${relationshipScope(session)}\0${parentId}`)
+          : null;
+        if (parent && !createsCycle(parent, session)) {
+          session.parent = parent.key;
+          if (!parent.children.includes(session.key)) parent.children.push(session.key);
+        } else if (parent) {
+          diagnostics.cyclicSpawnLinks++;
+        }
+      }
+      for (const event of session.events) {
+        const targetId = event.kind === 'tool' ? event.tool.intrinsicSpawnTarget : null;
+        if (typeof targetId !== 'string' || !targetId) continue;
+        const target = byScopedId.get(`${session.source}\0${relationshipScope(session)}\0${targetId.toLowerCase()}`);
+        if (target) event.tool.spawnTarget = target.key;
+      }
+    }
+
+    for (const session of sessions) {
+      for (const { uuid, ev } of session.spawnCandidates) {
+        if (typeof uuid !== 'string') continue;
+        let candidates = byRawId.get(uuid.toLowerCase()) ?? [];
+        const sameSource = candidates.filter((candidate) => candidate.source === session.source);
+        if (sameSource.length) candidates = sameSource;
+        candidates = candidates.filter((candidate) => candidate !== session);
+        if (candidates.length !== 1) {
+          if (candidates.length > 1) diagnostics.ambiguousSpawnLinks++;
+          continue;
+        }
+        const child = candidates[0];
+        if (!child.parent && !createsCycle(session, child)) {
+          child.parent = session.key;
+          if (!session.children.includes(child.key)) session.children.push(child.key);
+        } else if (!child.parent) {
+          diagnostics.cyclicSpawnLinks++;
+          continue;
+        }
+        ev.tool.spawnTarget ??= child.key;
+      }
+    }
+
+    revisionParts.sort();
+    const analysisByKey = new Map(
+      sessions.map((session) => [session.key, sessionIntelligence(session, pricing.value)]),
+    );
+    return {
+      roots: [...roots].sort(),
+      sessions,
+      byKey,
+      analysisByKey,
+      pricing: pricing.value,
+      diagnostics,
+      revision: crypto.createHash('sha256').update(revisionParts.join('\n')).digest('hex').slice(0, 20),
+    };
+  }
+
+  function getState(force = false, throttle = false) {
+    const now = Date.now();
+    if (force && throttle && snapshot && now - lastForcedRefreshAt < limits.minRefreshMs) {
+      snapshot.state.diagnostics.refreshThrottled++;
+      return snapshot.state;
+    }
+    if (force && throttle) lastForcedRefreshAt = now;
+    if (!force && snapshot && now - snapshot.createdAt < SNAPSHOT_TTL_MS) return snapshot.state;
+    const state = buildState();
+    snapshot = { createdAt: now, state };
+    return state;
+  }
+
+  function filteredState(source, force = false) {
+    const state = getState(force, true);
+    const sessions = source && source !== 'all'
+      ? state.sessions.filter((session) => session.source === source)
+      : state.sessions;
+    const counts = {};
+    for (const session of state.sessions) counts[session.source] = (counts[session.source] || 0) + 1;
+    return { ...state, sessions, counts };
+  }
+
+  const server = http.createServer((req, res) => {
+    const headOnly = req.method === 'HEAD';
+    try {
+      if (!isAllowedHost(req.headers.host, config.port) || !isAllowedOrigin(req.headers.origin, config.port)) {
+        return json(res, { error: 'forbidden host or origin' }, 403, headOnly);
+      }
+      const url = new URL(req.url ?? '/', `http://127.0.0.1:${config.port}`);
+      if (url.pathname.startsWith('/api/') && !isAuthorized(req.headers.authorization, apiToken)) {
+        res.setHeader('WWW-Authenticate', 'Bearer realm="runlume"');
+        return json(res, { error: 'authentication required' }, 401, headOnly);
+      }
+      if (req.method !== 'GET' && !headOnly) {
+        res.setHeader('Allow', 'GET, HEAD');
+        return json(res, { error: 'method not allowed' }, 405);
+      }
+
+      const source = url.searchParams.get('source');
+      const force = url.searchParams.get('refresh') === '1';
+      if (
+        url.pathname.startsWith('/api/')
+        && source
+        && source !== 'all'
+        && !adapters.some((adapter) => adapter.source === source)
+      ) {
+        return json(res, { error: 'unknown or disabled source' }, 400, headOnly);
+      }
+
+      if (url.pathname === '/api/dashboard') {
+        const state = filteredState(source, force);
+        return json(res, {
+          roots: redactedRoots(state.roots),
+          sources: adapters.map((adapter) => adapter.source),
+          counts: state.counts,
+          revision: state.revision,
+          diagnostics: redactedDiagnostics(state.diagnostics),
+          generatedAt: new Date().toISOString(),
+          sessions: state.sessions.map((session) => apiSessionSummary(session)),
+          stats: redactedStats(buildStats(state.sessions, {
+            days: config.days,
+            pricing: state.pricing,
+            analysisByKey: state.analysisByKey,
+          })),
+        }, 200, headOnly);
+      }
+      if (url.pathname === '/api/state') {
+        const state = filteredState(source, force);
+        return json(res, {
+          roots: redactedRoots(state.roots),
+          sources: adapters.map((adapter) => adapter.source),
+          counts: state.counts,
+          revision: state.revision,
+          diagnostics: redactedDiagnostics(state.diagnostics),
+          generatedAt: new Date().toISOString(),
+          sessions: state.sessions.map((session) => apiSessionSummary(session)),
+        }, 200, headOnly);
+      }
+      if (url.pathname === '/api/stats') {
+        const state = filteredState(source, force);
+        return json(res, redactedStats(buildStats(state.sessions, {
+          days: config.days,
+          pricing: state.pricing,
+          analysisByKey: state.analysisByKey,
+        })), 200, headOnly);
+      }
+      if (url.pathname === '/api/session') {
+        const state = getState(force, true);
+        const key = url.searchParams.get('key');
+        let session = key ? state.byKey.get(key) : null;
+        if (!session) {
+          const id = (url.searchParams.get('id') || '').toLowerCase();
+          const matches = state.sessions.filter((candidate) => candidate.id.toLowerCase() === id);
+          if (matches.length > 1) return json(res, { error: 'session id is ambiguous; use key' }, 409, headOnly);
+          session = matches[0];
+        }
+        if (!session) return json(res, { error: 'session not found' }, 404, headOnly);
+        const page = paginationFrom(url);
+        if (!page) return json(res, { error: `offset must be non-negative and limit must be 1-${MAX_EVENT_PAGE_LIMIT}` }, 400, headOnly);
+        const view = url.searchParams.get('view') ?? 'redacted';
+        if (view !== 'redacted' && view !== 'raw') {
+          return json(res, { error: 'view must be redacted or raw' }, 400, headOnly);
+        }
+        return json(res, sessionPageForApi(session, state.pricing, {
+          ...page,
+          revealSensitive: view === 'raw',
+          analysis: state.analysisByKey.get(session.key),
+        }), 200, headOnly);
+      }
+
+      let relative;
+      try {
+        relative = url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname).replace(/^\/+/, '');
+      } catch {
+        return json(res, { error: 'malformed URL path' }, 400, headOnly);
+      }
+      const filePath = path.resolve(STATIC_ROOT, relative);
+      const withinStaticRoot = filePath === STATIC_ROOT || filePath.startsWith(`${STATIC_ROOT}${path.sep}`);
+      let staticStat = null;
+      try { staticStat = withinStaticRoot ? fs.lstatSync(filePath) : null; } catch { /* handled as not found */ }
+      if (
+        withinStaticRoot
+        && staticStat?.isFile()
+        && !staticStat.isSymbolicLink()
+        && isRealPathWithin(STATIC_ROOT, filePath)
+      ) {
+        const body = fs.readFileSync(filePath);
+        res.writeHead(200, {
+          ...securityHeaders(MIME[path.extname(filePath)] ?? 'application/octet-stream', 'no-cache'),
+          'Content-Length': body.length,
+        });
+        return res.end(headOnly ? undefined : body);
+      }
+      return json(res, { error: 'not found' }, 404, headOnly);
+    } catch (err) {
+      const incident = crypto.randomBytes(6).toString('hex');
+      logger.error(`request failed [${incident}]: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+      return json(res, { error: `internal server error (${incident})` }, 500, headOnly);
+    }
+  });
+
+  server.on('clientError', (_err, socket) => {
+    if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+  });
+
+  return { server, getState, adapters, apiToken };
+}
+
+export function start(config, logger = console) {
+  const dashboard = createDashboard({ config, logger });
+  const { server } = dashboard;
+  server.on('error', (err) => {
+    logger.error(`server failed: ${err instanceof Error ? err.message : String(err)}`);
+    process.exitCode = 1;
+  });
+  server.listen(config.port, '127.0.0.1', () => {
+    const started = Date.now();
+    const state = dashboard.getState(true);
+    const bySource = {};
+    for (const session of state.sessions) bySource[session.source] = (bySource[session.source] || 0) + 1;
+    logger.log(`RunLume running at http://127.0.0.1:${config.port}/#token=${dashboard.apiToken}`);
+    logger.log(`sources: ${dashboard.adapters.map((adapter) => adapter.source).join(', ')} | window: ${Number.isFinite(config.days) ? `sessions active in the last ${config.days} days` : 'all history'}`);
+    logger.log(`sessions: ${state.sessions.length} ${JSON.stringify(bySource)} (initial scan ${Date.now() - started}ms)`);
+    if (!state.sessions.length) logger.log('No sessions found. Run "npm run sample" for demo data, or pass --all to scan all history.');
+    const diagnosticIssues = state.diagnostics.malformedLines
+      + state.diagnostics.invalidRows
+      + state.diagnostics.filesUnreadable
+      + state.diagnostics.filesTooLarge
+      + state.diagnostics.adapterErrors;
+    if (diagnosticIssues) logger.warn(`data quality: ${JSON.stringify(state.diagnostics)}`);
+  });
+  return dashboard;
+}
+
+const isMain = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(__filename);
+  } catch {
+    return pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
+  }
+})();
+if (isMain) {
+  const args = process.argv.slice(2);
+  if (args.includes('--help')) {
+    console.log(HELP);
+  } else if (args.includes('--version')) {
+    console.log(PACKAGE.version);
+  } else {
+    try {
+      start(parseConfig(args));
+    } catch (err) {
+      console.error(`error: ${err instanceof Error ? err.message : String(err)}\n\n${HELP}`);
+      process.exitCode = 1;
+    }
+  }
+}

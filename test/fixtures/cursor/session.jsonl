@@ -1,0 +1,5 @@
+{"role":"user","message":{"content":[{"type":"text","text":"Update the synthetic dashboard card"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"I will update the card and add a test."},{"type":"tool_use","name":"StrReplace","input":{"path":"/workspace/dashboard/card.js","old_string":"export const label = 'Old';","new_string":"export const label = 'Cursor';"}},{"type":"tool_use","name":"Write","input":{"path":"/workspace/dashboard/card.test.js","contents":"import assert from 'node:assert/strict';\nassert.equal('Cursor', 'Cursor');\n"}}]}}
+{"type":"turn_ended","status":"success"}
+{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","input":{"command":"npm test","description":"Run the tests"}}]}}
+{"type":"turn_ended","status":"error","error":"Synthetic test failure"}

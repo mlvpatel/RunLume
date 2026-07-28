@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/mlvpatel/RunLume/discussions
+    about: Use Discussions for setup help and early ideas.
+  - name: Security report
+    url: https://github.com/mlvpatel/RunLume/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue.

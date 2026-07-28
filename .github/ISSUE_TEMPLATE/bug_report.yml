@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a reproducible RunLume problem using synthetic or redacted data.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never attach real transcripts, prompts, tool results, credentials, account IDs, or local paths. Build the smallest synthetic reproduction you can.
+  - type: input
+    id: version
+    attributes:
+      label: RunLume version
+      placeholder: 0.3.0 or commit SHA
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, Node.js version, browser, and agent source.
+      placeholder: macOS 15, Node.js 24, Safari, Codex
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction
+      description: Give exact steps and a minimal synthetic fixture when relevant.
+      placeholder: |
+        1. Run ...
+        2. Open ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed private transcripts, prompts, reasoning, credentials, account IDs, and local paths.
+          required: true

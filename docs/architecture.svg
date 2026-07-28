@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="780" viewBox="0 0 1400 780" role="img" aria-labelledby="title desc">
+  <title id="title">RunLume architecture</title>
+  <desc id="desc">Local agent files and optional imports pass through bounded adapters, deterministic analytics, a redacted token-protected API, and an accessible localhost dashboard. All processing stays inside the local machine boundary.</desc>
+  <defs>
+    <linearGradient id="canvas" x1="0" y1="0" x2="1400" y2="780" gradientUnits="userSpaceOnUse"><stop stop-color="#ffffff"/><stop offset="1" stop-color="#f3f7fd"/></linearGradient>
+    <filter id="shadow" x="-20%" y="-25%" width="140%" height="160%"><feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#102a43" flood-opacity=".08"/></filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0l10 5-10 5z" fill="#6b7c93"/></marker>
+  </defs>
+  <rect width="1400" height="780" rx="32" fill="url(#canvas)"/>
+  <text x="72" y="72" fill="#1d1d1f" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="38" font-weight="720" letter-spacing="-1">How RunLume stays local</text>
+  <text x="72" y="108" fill="#5f6368" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="19">One read-only path from transcript files to an authenticated dashboard.</text>
+  <rect x="48" y="142" width="1304" height="492" rx="30" fill="none" stroke="#7caee6" stroke-width="2" stroke-dasharray="9 9"/>
+  <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+    <rect x="76" y="126" width="218" height="34" rx="17" fill="#e7f2ff"/><circle cx="98" cy="143" r="6" fill="#12805c"/><text x="114" y="149" fill="#24527a" font-size="15" font-weight="650">Your local machine</text>
+    <g transform="translate(78 210)" filter="url(#shadow)">
+      <rect width="258" height="336" rx="24" fill="#ffffff" stroke="#e1e6eb"/><rect x="22" y="22" width="54" height="54" rx="15" fill="#eef5ff"/><path d="M39 38h20M39 47h20M39 56h12" stroke="#0066cc" stroke-width="3" stroke-linecap="round"/>
+      <text x="22" y="108" fill="#1d1d1f" font-size="23" font-weight="700">Sources</text><text x="22" y="140" fill="#5f6368" font-size="15">Local JSONL transcripts</text>
+      <text x="22" y="172" fill="#334155" font-size="15">Claude Code · Cursor</text><text x="22" y="198" fill="#334155" font-size="15">Codex · Gemini · Hermes</text><text x="22" y="224" fill="#334155" font-size="15">API &amp; local model logs</text>
+      <line x1="22" y1="248" x2="236" y2="248" stroke="#e5e7eb"/><text x="22" y="278" fill="#5f6368" font-size="14">Explicit opt-in only</text><text x="22" y="304" fill="#334155" font-size="15">API and local-model logs</text>
+    </g>
+    <path d="M348 378h54" stroke="#6b7c93" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <g transform="translate(414 210)" filter="url(#shadow)">
+      <rect width="258" height="336" rx="24" fill="#ffffff" stroke="#e1e6eb"/><rect x="22" y="22" width="54" height="54" rx="15" fill="#eef5ff"/><path d="M39 37h20M39 47h20M39 57h20M48 31v32" stroke="#0066cc" stroke-width="2.6" stroke-linecap="round"/>
+      <text x="22" y="108" fill="#1d1d1f" font-size="23" font-weight="700">Normalize</text><text x="22" y="140" fill="#5f6368" font-size="15">adapters.mjs</text>
+      <text x="22" y="176" fill="#334155" font-size="15">Sessions and events</text><text x="22" y="204" fill="#334155" font-size="15">Models and providers</text><text x="22" y="232" fill="#334155" font-size="15">Tools and outcomes</text><text x="22" y="260" fill="#334155" font-size="15">Parent and child links</text>
+      <rect x="22" y="286" width="214" height="28" rx="14" fill="#f2f7fc"/><text x="35" y="305" fill="#24527a" font-size="13" font-weight="650">bounded · tolerant · read only</text>
+    </g>
+    <path d="M684 378h54" stroke="#6b7c93" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <g transform="translate(750 210)" filter="url(#shadow)">
+      <rect width="258" height="336" rx="24" fill="#ffffff" stroke="#e1e6eb"/><rect x="22" y="22" width="54" height="54" rx="15" fill="#eef5ff"/><path d="M36 58l10-14 9 7 9-18" fill="none" stroke="#0066cc" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="22" y="108" fill="#1d1d1f" font-size="23" font-weight="700">Analyze</text><text x="22" y="140" fill="#5f6368" font-size="15">analytics.mjs</text>
+      <text x="22" y="176" fill="#334155" font-size="15">API-equivalent cost</text><text x="22" y="204" fill="#334155" font-size="15">Parsed code impact</text><text x="22" y="232" fill="#334155" font-size="15">Workflow signals</text><text x="22" y="260" fill="#334155" font-size="15">Source and provider views</text>
+      <rect x="22" y="286" width="214" height="28" rx="14" fill="#f2f7fc"/><text x="35" y="305" fill="#24527a" font-size="13" font-weight="650">deterministic · no model calls</text>
+    </g>
+    <path d="M1020 378h54" stroke="#6b7c93" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <g transform="translate(1086 210)" filter="url(#shadow)">
+      <rect width="238" height="336" rx="24" fill="#1d1d1f"/><rect x="22" y="22" width="54" height="54" rx="15" fill="#27364a"/><path d="M38 47h22v15H38zM42 47v-6a7 7 0 0114 0v6" fill="none" stroke="#76b9ff" stroke-width="2.5"/>
+      <text x="22" y="108" fill="#ffffff" font-size="23" font-weight="700">Serve</text><text x="22" y="140" fill="#b7c4d4" font-size="15">server.mjs + public/</text>
+      <text x="22" y="176" fill="#edf4ff" font-size="15">127.0.0.1 only</text><text x="22" y="204" fill="#edf4ff" font-size="15">Per-launch Bearer token</text><text x="22" y="232" fill="#edf4ff" font-size="15">Redacted by default</text><text x="22" y="260" fill="#edf4ff" font-size="15">Accessible dashboard</text>
+      <rect x="22" y="286" width="194" height="28" rx="14" fill="#27364a"/><text x="35" y="305" fill="#9dccff" font-size="13" font-weight="650">no telemetry · no cloud DB</text>
+    </g>
+  </g>
+  <g transform="translate(72 670)" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+    <text x="0" y="18" fill="#1d1d1f" font-size="17" font-weight="700">Safety rails</text>
+    <g transform="translate(124 0)" fill="#334155" font-size="15"><text x="0" y="18">Path containment</text><text x="156" y="18">•</text><text x="180" y="18">Symlink rejection</text><text x="332" y="18">•</text><text x="356" y="18">File, byte, event, and session budgets</text><text x="664" y="18">•</text><text x="688" y="18">Restrictive browser headers</text></g>
+    <text x="0" y="62" fill="#6e6e73" font-size="15">Network exposure is outside the supported threat model.</text>
+  </g>
+</svg>

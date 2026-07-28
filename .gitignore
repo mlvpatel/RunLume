@@ -1,0 +1,51 @@
+# Dependencies and generated reports
+node_modules/
+.pnpm-store/
+coverage/
+playwright-report/
+test-results/
+*.log
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.local
+
+# Generated or imported transcript data
+sample-data/
+imports/
+captures/
+logs/
+transcripts/
+local-data/
+
+# Local tooling and generated packages
+*.tgz
+.cache/
+.nyc_output/
+.direnv/
+.envrc
+.npmrc
+
+# Operating-system metadata
+.DS_Store
+
+# Raw agent data and local databases
+*.jsonl
+!test/fixtures/**/*.jsonl
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Credentials and signing material
+*.key
+*.pem
+*.p12
+*.pfx
+*.keystore
+
+# Editor and local workspace state
+.idea/
+.vscode/
