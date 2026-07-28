@@ -1,6 +1,6 @@
 {
   "name": "runlume",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Local-first analytics for AI coding sessions, provider cost, code impact, workflow, and timelines.",
   "type": "module",
   "files": [
@@ -10,6 +10,7 @@
     "pricing.json",
     "public/",
     "sample/",
+    "docs/",
     "CHANGELOG.md",
     "SECURITY.md"
   ],
@@ -30,7 +31,7 @@
     "playwright": "1.62.0"
   },
   "engines": {
-    "node": ">=22"
+    "node": "^22.0.0 || ^24.0.0 || ^26.0.0"
   },
   "keywords": [
     "agent",

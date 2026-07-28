@@ -12,7 +12,15 @@ function storageSet(name, key, value) {
   }
 }
 
-let state = { sessions: [], sources: [], roots: [], counts: {}, diagnostics: {}, revision: '' };
+let state = {
+  sessions: [],
+  sources: [],
+  roots: [],
+  counts: {},
+  diagnostics: {},
+  sessionOutput: { total: 0, shown: 0, omitted: 0 },
+  revision: '',
+};
 let stats = null;
 let selected = null;
 let sourceFilter = storageGet('localStorage', 'runlume-source') || 'all';
@@ -163,6 +171,11 @@ async function loadState(force = false) {
       roots: payload.roots ?? [],
       counts: payload.counts ?? {},
       diagnostics: payload.diagnostics ?? {},
+      sessionOutput: payload.sessionOutput ?? {
+        total: payload.sessions?.length ?? 0,
+        shown: payload.sessions?.length ?? 0,
+        omitted: 0,
+      },
       revision: payload.revision ?? '',
     };
     $('#roots').textContent = state.roots.length
@@ -275,7 +288,7 @@ function renderTree() {
     const roots = sessions
       .filter((s) => !s.parent || !byId.has(s.parent))
       .sort((a, b) => (b.endedAt || '').localeCompare(a.endedAt || ''));
-    for (const s of roots) html += nodeHtml(s, byId, false);
+    html += treeNodesHtml(roots, byId);
     html += '</section>';
   }
   $('#tree').innerHTML = html || '<div class="agent-name">no sessions</div>';
@@ -287,20 +300,47 @@ function renderTree() {
   }
 }
 
-function nodeHtml(s, byId, isChild) {
+function nodeButtonHtml(s, isChild) {
   const isLive = s.endedAt && Date.now() - Date.parse(s.endedAt) < 3 * 60_000;
   const live = isLive ? '<span class="live">● live</span>' : '';
   const errs = s.stats.errors ? `<span class="err">${s.stats.errors} error${s.stats.errors === 1 ? '' : 's'}</span>` : '';
-  const kids = s.children.map((id) => byId.get(id)).filter(Boolean);
-  const tools = Object.values(s.stats.toolCounts).reduce((a, b) => a + b, 0);
-  return `
-    <div class="tree-node">
-      <button class="node-btn ${selected === s.key ? 'active' : ''}" data-key="${esc(s.key)}">
-        <span class="node-label">${isChild ? '<span class="spawn-tag">↳ </span>' : ''}${esc(s.label)}</span>
-        <span class="node-meta">${live}<span>${s.startedAt ? new Date(s.startedAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''}</span><span>${tools} ${tools === 1 ? 'tool' : 'tools'}</span>${errs}</span>
-      </button>
-      ${kids.length ? `<div class="tree-children">${kids.map((k) => nodeHtml(k, byId, true)).join('')}</div>` : ''}
-    </div>`;
+  const tools = Number.isFinite(s.stats.toolCallsTotal)
+    ? s.stats.toolCallsTotal
+    : Object.values(s.stats.toolCounts ?? {}).reduce((a, b) => a + Number(b || 0), 0);
+  return `<button class="node-btn ${selected === s.key ? 'active' : ''}" data-key="${esc(s.key)}">
+    <span class="node-label">${isChild ? '<span class="spawn-tag">↳ </span>' : ''}${esc(s.label)}</span>
+    <span class="node-meta">${live}<span>${s.startedAt ? new Date(s.startedAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''}</span><span>${tools} ${tools === 1 ? 'tool' : 'tools'}</span>${errs}</span>
+  </button>`;
+}
+
+function treeNodesHtml(roots, byId) {
+  const stack = [...roots].reverse().map((session) => ({ session, isChild: false }));
+  const visited = new Set();
+  let html = '';
+  while (stack.length) {
+    const item = stack.pop();
+    if (item.close) {
+      html += item.close;
+      continue;
+    }
+    const { session, isChild } = item;
+    if (!session || visited.has(session.key)) continue;
+    visited.add(session.key);
+    const children = (session.children ?? [])
+      .map((id) => byId.get(id))
+      .filter((child) => child && !visited.has(child.key));
+    html += `<div class="tree-node">${nodeButtonHtml(session, isChild)}`;
+    if (!children.length) {
+      html += '</div>';
+      continue;
+    }
+    html += '<div class="tree-children">';
+    stack.push({ close: '</div></div>' });
+    for (let index = children.length - 1; index >= 0; index--) {
+      stack.push({ session: children[index], isChild: true });
+    }
+  }
+  return html;
 }
 
 // ── main: overview + charts ──────────────────────────────────────
@@ -497,6 +537,15 @@ function diagnosticBanner() {
   }
   if (d.refreshThrottled) issues.push(`${fmtInt(d.refreshThrottled)} refresh request${d.refreshThrottled === 1 ? '' : 's'} throttled`);
   if (d.pricingError) issues.push('pricing disabled because the pricing table is invalid or unreadable');
+  if (state.sessionOutput?.omitted) {
+    issues.push(`${fmtInt(state.sessionOutput.omitted)} session row${state.sessionOutput.omitted === 1 ? '' : 's'} omitted from the browser view; totals still include them`);
+  }
+  const aggregateOmissions = Object.entries(stats?.outputLimits ?? {})
+    .filter(([, value]) => value && typeof value === 'object' && value.omitted > 0)
+    .reduce((total, [, value]) => total + value.omitted, 0);
+  if (aggregateOmissions) {
+    issues.push(`${fmtInt(aggregateOmissions)} lower-ranked aggregate row${aggregateOmissions === 1 ? '' : 's'} omitted from browser tables; totals still include them`);
+  }
   const scanned = `${fmtInt(d.filesDiscovered ?? 0)} transcript file${d.filesDiscovered === 1 ? '' : 's'} scanned`;
   return `<div class="data-quality ${issues.length ? 'warn' : 'ok'}" role="${issues.length ? 'alert' : 'status'}">
     <b>Data quality</b><span>${issues.length ? issues.map(esc).join(' · ') : `${scanned} with no parser warnings`}</span>
@@ -1214,7 +1263,7 @@ function wrappedSlides() {
         ${cardCell(fmtInt(t.spawns), 'sub-agents')}
         ${cardCell(wrappedRoi == null ? fmtMoney(stats.cost.total) : `${wrappedRoi.toFixed(1)}×`, wrappedRoi == null ? 'API equivalent' : 'plan ratio')}
       </div>
-      <div class="foot"><span>Run<span class="dot">·</span>Lume</span><span>${t1 ? `favourite tool: ${esc(t1.name)}` : ''}</span></div>
+      <div class="foot"><span>Run<span class="dot">·</span>Lume</span><span>${t1 ? `favorite tool: ${esc(t1.name)}` : ''}</span></div>
     </div>`,
   });
 

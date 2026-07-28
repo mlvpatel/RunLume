@@ -22,9 +22,9 @@ npm run test:package
 Changes to an adapter should include synthetic fixtures for every accepted
 event shape. Changes to analytics should include exact expected metrics,
 including unknown or malformed input. Server changes should preserve loopback
-binding, Host/Origin validation, security headers, read-only behaviour, and
+binding, Host/Origin validation, security headers, read-only behavior, and
 bounded responses. UI changes should preserve the light theme under both
-operating-system colour preferences and pass desktop, small-phone, and
+operating-system color preferences and pass desktop, small-phone, and
 landscape WCAG checks in all three browser engines.
 
 Never commit real agent transcripts, prompts, reasoning, tool results, local

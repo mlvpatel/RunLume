@@ -12,8 +12,10 @@ import {
   isRealPathWithin,
   latestSessionMs,
   parseConfig,
+  redactedStats,
   sessionPageForApi,
 } from '../server.mjs';
+import { buildStats } from '../analytics.mjs';
 
 const pricingFile = path.resolve(new URL('../pricing.json', import.meta.url).pathname);
 const quietLogger = { log() {}, warn() {}, error() {} };
@@ -142,7 +144,7 @@ test('session API pages are complete and redact sensitive transcript content by 
     children: [],
     events,
     stats: {
-      toolCounts: { exec: 1 },
+      toolCounts: Object.fromEntries(Array.from({ length: 300 }, (_, index) => [`tool-${index}`, 1])),
       tokensIn: 0,
       tokensOut: 0,
       tokensCacheRead: 0,
@@ -161,6 +163,9 @@ test('session API pages are complete and redact sensitive transcript content by 
   assert.equal(redacted.events[0].tool.result, '[redacted tool result]');
   assert.equal(redacted.label, 'Session public-k');
   assert.equal(redacted.agent, 'local agent');
+  assert.equal(Object.keys(redacted.stats.toolCounts).length, 250);
+  assert.equal(redacted.stats.toolNamesOmitted, 50);
+  assert.equal(redacted.stats.toolCallsTotal, 300);
 
   const raw = sessionPageForApi(session, null, {
     offset: 300,
@@ -171,6 +176,53 @@ test('session API pages are complete and redact sensitive transcript content by 
   assert.equal(raw.events[0].tool.args.password, 'secret');
   assert.equal(raw.events[0].tool.result, 'secret result');
   assert.equal(raw.label, 'Secret task');
+});
+
+test('aggregate API collections are capped with explicit omission counts', () => {
+  const toolCounts = Object.fromEntries(Array.from({ length: 300 }, (_, index) => [`tool-${index}`, 1]));
+  const events = Object.keys(toolCounts).map((name) => ({
+    kind: 'tool',
+    ts: '2026-07-20T10:00:00Z',
+    tool: {
+      id: name,
+      name,
+      args: {},
+      result: 'ok',
+      isError: false,
+      resultTs: '2026-07-20T10:00:01Z',
+      confirmed: true,
+    },
+  }));
+  const stats = buildStats([{
+    key: 'hermes:bounded',
+    id: 'bounded',
+    source: 'hermes',
+    agent: 'test',
+    file: '/tmp/bounded.jsonl',
+    cwd: '/workspace/project',
+    label: 'Bounded',
+    model: null,
+    provider: null,
+    runtime: null,
+    startedAt: '2026-07-20T10:00:00Z',
+    endedAt: '2026-07-20T10:00:01Z',
+    parent: null,
+    children: [],
+    events,
+    usage: [],
+    stats: {
+      toolCounts,
+      tokensIn: 0,
+      tokensOut: 0,
+      tokensCacheRead: 0,
+      tokensCacheWrite: 0,
+      messages: 0,
+      errors: 0,
+    },
+  }], { days: Infinity, pricing: null });
+  const safe = redactedStats(stats);
+  assert.equal(safe.tools.length, 250);
+  assert.deepEqual(safe.outputLimits.tools, { total: 300, shown: 250, omitted: 50 });
 });
 
 test('CLI configuration rejects ambiguous and invalid options', () => {
@@ -209,6 +261,10 @@ test('CLI configuration rejects ambiguous and invalid options', () => {
   assert.throws(
     () => parseConfig([], { RUNLUME_MAX_EVENTS: '0' }),
     /MAX_EVENTS must be an integer of at least 1/,
+  );
+  assert.throws(
+    () => parseConfig([], { RUNLUME_MAX_EVENTS: '2000001' }),
+    /at most 2000000/,
   );
   assert.throws(
     () => createDashboard({ config: config('.', { days: 3651 }), logger: quietLogger }),

@@ -1,5 +1,7 @@
 import path from 'node:path';
 
+const MAX_ANALYTICS_PATH_LENGTH = 4096;
+
 export const EDIT_TOOLS = new Set([
   'edit', 'write', 'notebookedit', 'multiedit', 'strreplace', 'str_replace_editor', 'apply_patch',
 ]);
@@ -94,7 +96,7 @@ const lineCount = (value) => {
 function canonicalProjectPath(value) {
   if (typeof value !== 'string') return null;
   const raw = value.trim().replaceAll('\\', '/');
-  if (!raw) return null;
+  if (!raw || raw.length > MAX_ANALYTICS_PATH_LENGTH) return null;
 
   const isUnc = raw.startsWith('//');
   const body = path.posix.normalize(isUnc ? raw.slice(2) : raw);
@@ -117,6 +119,7 @@ function isCaseInsensitiveProjectPath(value) {
 function cleanFilePath(value, cwd = null) {
   if (typeof value !== 'string') return null;
   let out = value.trim().replace(/^['"]|['"]$/g, '').replaceAll('\\', '/');
+  if (!out || out.length > MAX_ANALYTICS_PATH_LENGTH) return null;
   out = out.replace(/^[ab]\//, '');
   const normalizedCwd = canonicalProjectPath(cwd);
   const comparableOut = isCaseInsensitiveProjectPath(normalizedCwd) ? out.toLowerCase() : out;
@@ -332,8 +335,71 @@ function validIsoDay(value) {
   return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
 }
 
+function effectiveInterval(rate, pricing) {
+  const from = rate.effectiveFrom ?? pricing.effectiveFrom;
+  const to = rate.effectiveTo ?? pricing.effectiveTo;
+  if ((from && !validIsoDay(from)) || (to && !validIsoDay(to))) return null;
+  return {
+    from: from ? Date.parse(`${from}T00:00:00Z`) : Number.NEGATIVE_INFINITY,
+    to: to ? Date.parse(`${to}T00:00:00Z`) : Number.POSITIVE_INFINITY,
+  };
+}
+
+function findIntervalOverlap(intervals) {
+  const ordered = [...intervals].sort((a, b) => a.from - b.from || b.to - a.to);
+  let active = null;
+  for (const current of ordered) {
+    if (active && current.index !== active.index && current.from < active.to) {
+      return [active, current];
+    }
+    if (!active || current.to > active.to) active = current;
+  }
+  return null;
+}
+
+function pricingOverlapIssues(intervals) {
+  const byAlias = new Map();
+  for (const interval of intervals) {
+    const group = byAlias.get(interval.alias) ?? [];
+    group.push(interval);
+    byAlias.set(interval.alias, group);
+  }
+
+  const candidateGroups = new Map(byAlias);
+  for (const [alias, group] of byAlias) {
+    const dated = /^(.*)-(?:\d{8}|\d{4}-\d{2}-\d{2})$/.exec(alias);
+    if (!dated) continue;
+    const suffixDate = alias.slice(dated[1].length + 1);
+    if (!(/^\d{8}$/.test(suffixDate) || validIsoDay(suffixDate))) continue;
+    const datedBaseRows = (byAlias.get(dated[1]) ?? []).filter((row) => row.allowDatedSuffix);
+    if (datedBaseRows.length) candidateGroups.set(alias, [...group, ...datedBaseRows]);
+  }
+
+  const issues = [];
+  const reported = new Set();
+  for (const [alias, group] of candidateGroups) {
+    const globals = group.filter((row) => !row.source);
+    const scopes = new Set(group.map((row) => row.source).filter(Boolean));
+    const scopedGroups = scopes.size
+      ? [...scopes].map((source) => [...globals, ...group.filter((row) => row.source === source)])
+      : [globals];
+    for (const scoped of scopedGroups) {
+      const overlap = findIntervalOverlap(scoped);
+      if (!overlap) continue;
+      const [left, right] = overlap;
+      const pair = [left.index, right.index].sort((a, b) => a - b);
+      const key = `${pair[0]}:${pair[1]}:${alias}`;
+      if (reported.has(key)) continue;
+      reported.add(key);
+      issues.push(`models[${pair[0]}] overlaps models[${pair[1]}] for model ${alias}`);
+    }
+  }
+  return issues;
+}
+
 export function validatePricing(pricing) {
   const issues = [];
+  const intervals = [];
   if (!pricing || typeof pricing !== 'object') return ['pricing must be an object'];
   if (!Array.isArray(pricing.models) || !pricing.models.length) issues.push('models must be a non-empty array');
   if (typeof pricing.currency !== 'string' || !/^[A-Z]{3}$/.test(pricing.currency)) issues.push('currency must be a three-letter uppercase code');
@@ -352,6 +418,16 @@ export function validatePricing(pricing) {
     if (typeof rate.id !== 'string' || !rate.id) issues.push(`${prefix}.id is required`);
     else if (ids.has(rate.id)) issues.push(`${prefix}.id duplicates ${rate.id}`);
     else ids.add(rate.id);
+    if (
+      rate.source != null
+      && (
+        typeof rate.source !== 'string'
+        || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(rate.source)
+      )
+    ) {
+      issues.push(`${prefix}.source is not a valid source identifier`);
+    }
+    const validAliases = [];
     if (!Array.isArray(rate.models) || !rate.models.length) {
       issues.push(`${prefix}.models must be a non-empty array`);
     } else {
@@ -368,7 +444,10 @@ export function validatePricing(pricing) {
         }
         const normalized = model.toLowerCase();
         if (aliases.has(normalized)) issues.push(`${prefix}.models duplicates ${model}`);
-        aliases.add(normalized);
+        else {
+          aliases.add(normalized);
+          validAliases.push(normalized);
+        }
       }
     }
     if (rate.allowDatedSuffix != null && typeof rate.allowDatedSuffix !== 'boolean') {
@@ -392,7 +471,20 @@ export function validatePricing(pricing) {
     if (!Number.isFinite(rate.input) || !Number.isFinite(rate.output)) {
       issues.push(`${prefix} requires numeric input and output rates`);
     }
+    const interval = effectiveInterval(rate, pricing);
+    if (interval && interval.from < interval.to && (rate.source == null || typeof rate.source === 'string')) {
+      for (const alias of validAliases) {
+        intervals.push({
+          ...interval,
+          alias,
+          allowDatedSuffix: rate.allowDatedSuffix === true,
+          index,
+          source: rate.source ?? null,
+        });
+      }
+    }
   }
+  issues.push(...pricingOverlapIssues(intervals));
   return issues;
 }
 

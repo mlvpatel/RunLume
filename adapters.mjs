@@ -1,6 +1,6 @@
 /**
  * Source adapters: each discovers session transcript files for one agent CLI
- * and parses them into the shared normalised trajectory model:
+ * and parses them into the shared normalized trajectory model:
  *
  *   session: { id, source, agent, file, label, model, startedAt, endedAt,
  *              events[], stats, spawnCandidates[], children[], parent }
@@ -20,6 +20,8 @@ export const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 const SPAWN_TOOL_RE = /spawn|subagent|sub_agent|^task$|^agent$/i;
 const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 const MAX_SESSION_ID_LENGTH = 512;
+const MAX_TOOL_NAME_LENGTH = 160;
+const MAX_MODEL_NAME_LENGTH = 160;
 const INJECTED_METADATA_TAGS = new Set([
   'agent_context',
   'app-context',
@@ -58,6 +60,18 @@ function tokenSum(...values) {
   );
 }
 
+function boundedIdentifier(value, maxLength, fallback = null) {
+  if (typeof value !== 'string') return fallback;
+  const normalized = value.trim();
+  return normalized ? normalized.slice(0, maxLength) : fallback;
+}
+
+function assignSessionModel(session, value) {
+  const model = boundedIdentifier(value, MAX_MODEL_NAME_LENGTH);
+  if (model) session.model = model;
+  return model;
+}
+
 // ── shared helpers ───────────────────────────────────────────────────────────
 export function newSession(source, file, agent) {
   const fallbackId = path.basename(file, '.jsonl').slice(0, MAX_SESSION_ID_LENGTH) || `${source}-session`;
@@ -75,7 +89,7 @@ export function newSession(source, file, agent) {
     endedAt: null,
     events: [],
     usage: [],
-    stats: { toolCounts: {}, tokensIn: 0, tokensOut: 0, tokensCacheRead: 0, tokensCacheWrite: 0, messages: 0, errors: 0 },
+    stats: { toolCounts: Object.create(null), tokensIn: 0, tokensOut: 0, tokensCacheRead: 0, tokensCacheWrite: 0, messages: 0, errors: 0 },
     spawnCandidates: [],
     children: [],
     parent: null,
@@ -155,7 +169,11 @@ function appendUsage(session, normalized, ts, model) {
   session.stats.tokensOut = tokenSum(session.stats.tokensOut, safe.output);
   session.stats.tokensCacheRead = tokenSum(session.stats.tokensCacheRead, safe.cacheRead);
   session.stats.tokensCacheWrite = tokenSum(session.stats.tokensCacheWrite, safe.cacheWrite);
-  session.usage.push({ ts, model: model ?? null, ...safe });
+  session.usage.push({
+    ts,
+    model: boundedIdentifier(model, MAX_MODEL_NAME_LENGTH),
+    ...safe,
+  });
 }
 
 function readDiagnostics(file, streamed) {
@@ -305,11 +323,12 @@ export function readJsonDocument(file, maxBytes = maxTranscriptBytes(), onRow = 
 }
 
 function addToolCall(session, pending, ts, { id, name, args }) {
-  const ev = { kind: 'tool', ts, tool: { id: id ?? null, name, args: args ?? {}, result: null, isError: false, resultTs: null } };
-  session.stats.toolCounts[name] = (session.stats.toolCounts[name] || 0) + 1;
+  const toolName = boundedIdentifier(name, MAX_TOOL_NAME_LENGTH, 'tool');
+  const ev = { kind: 'tool', ts, tool: { id: id ?? null, name: toolName, args: args ?? {}, result: null, isError: false, resultTs: null } };
+  session.stats.toolCounts[toolName] = tokenSum(session.stats.toolCounts[toolName], 1);
   session.events.push(ev);
   if (id) pending.set(id, ev);
-  if (SPAWN_TOOL_RE.test(name)) {
+  if (SPAWN_TOOL_RE.test(toolName)) {
     for (const u of JSON.stringify(args ?? {}).match(UUID_RE) ?? []) session.spawnCandidates.push({ uuid: u.toLowerCase(), ev });
   }
   return ev;
@@ -418,8 +437,8 @@ function parseGenericMessage(session, pending, obj, diagnostics = null) {
 
   if (role === 'assistant') {
     session.stats.messages++;
-    if (m.model) session.model = m.model;
-    recordUsage(session, m.usage, ts, m.model ?? session.model);
+    const messageModel = assignSessionModel(session, m.model);
+    recordUsage(session, m.usage, ts, messageModel ?? session.model);
     for (const b of blocksOf(m.content)) {
       const t = b.type ?? 'text';
       if (t === 'thinking' || t === 'redacted_thinking') session.events.push({ kind: 'thinking', ts, text: b.thinking ?? b.text ?? '' });
@@ -455,7 +474,7 @@ export function parseGenericAgentFile(source, file, agent, maxBytes = maxTranscr
       return;
     }
     if (obj.type === 'model_change' && typeof obj.model === 'string') {
-      session.model = obj.model;
+      assignSessionModel(session, obj.model);
       return;
     }
     parseGenericMessage(session, pending, obj, rowDiagnostics);
@@ -620,7 +639,7 @@ export function parseCodexFile(file, maxBytes = maxTranscriptBytes()) {
     if (obj.type === 'turn_context') {
       if (p.model) {
         currentModel = p.model;
-        session.model = p.model;
+        assignSessionModel(session, p.model);
       }
       return;
     }
@@ -842,7 +861,7 @@ export function parseCursorFile(file, agent = 'cursor', {
         session.cwd = obj.cwd;
         session.agent = path.basename(obj.cwd) || agent;
       }
-      if (typeof obj.model === 'string') session.model = obj.model;
+      assignSessionModel(session, obj.model);
       return;
     }
     if (obj.type === 'user') {
@@ -893,7 +912,7 @@ export function parseCursorFile(file, agent = 'cursor', {
     if (obj.type === 'result') {
       flushAssistantDelta();
       if (obj.is_error === true || obj.subtype === 'error') session.stats.errors++;
-      if (typeof obj.model === 'string') session.model = obj.model;
+      assignSessionModel(session, obj.model);
     }
   });
   flushAssistantDelta();
@@ -1020,10 +1039,10 @@ function parseGeminiMessages(session, messages, diagnostics) {
     }
     if (message.type === 'gemini') {
       session.stats.messages++;
-      if (typeof message.model === 'string') session.model = message.model;
+      const messageModel = assignSessionModel(session, message.model);
       if (text) session.events.push({ kind: 'assistant', ts, text });
       const tokens = geminiTokens(message.tokens);
-      if (tokens) appendUsage(session, tokens, ts, message.model ?? session.model);
+      if (tokens) appendUsage(session, tokens, ts, messageModel ?? session.model);
       for (const thought of message.thoughts ?? []) {
         const thoughtText = geminiThoughtText(thought);
         if (thoughtText) {
@@ -1112,7 +1131,7 @@ export function parseGeminiFile(file, agent = 'gemini', {
       if (obj.type === 'init') {
         flushAssistantDelta();
         if (Object.hasOwn(obj, 'session_id')) assignSessionId(session, obj.session_id, rowDiagnostics);
-        if (typeof obj.model === 'string') session.model = obj.model;
+        assignSessionModel(session, obj.model);
         return;
       }
       if (obj.type === 'message') {
@@ -1452,8 +1471,7 @@ function importedOpenAiUsage(session, response, ts, model) {
 
 function importedOpenAiResponse(session, pending, response, ts) {
   if (!response || typeof response !== 'object') return;
-  const model = response.model ?? session.model;
-  if (model) session.model = model;
+  const model = assignSessionModel(session, response.model) ?? session.model;
   const assistant = [];
   const thoughts = [];
   const toolCalls = [];
@@ -1499,7 +1517,7 @@ function importedOpenAiResponse(session, pending, response, ts) {
 
 function importedAnthropicResponse(session, pending, response, ts, diagnostics) {
   if (!response || typeof response !== 'object') return;
-  if (response.model) session.model = response.model;
+  assignSessionModel(session, response.model);
   session.stats.messages++;
   for (const block of blocksOf(response.content)) {
     if (block?.type === 'text' && block.text) {
@@ -1530,7 +1548,7 @@ function importedAnthropicResponse(session, pending, response, ts, diagnostics) 
 
 function importedOllamaResponse(session, pending, response, ts, rowIndex) {
   if (!response || typeof response !== 'object') return;
-  if (response.model) session.model = response.model;
+  assignSessionModel(session, response.model);
   const message = response.message ?? {};
   const text = importedText(message.content);
   const thinking = importedText(message.thinking);
@@ -1556,7 +1574,7 @@ function importedOllamaResponse(session, pending, response, ts, rowIndex) {
 
 function importedLmStudioResponse(session, pending, response, ts, rowIndex) {
   if (!response || typeof response !== 'object') return;
-  if (response.model_instance_id) session.model = response.model_instance_id;
+  assignSessionModel(session, response.model_instance_id);
   const output = response.output ?? [];
   session.stats.messages++;
   for (const [index, item] of output.entries()) {
@@ -1641,8 +1659,10 @@ export function parseApiLogFile(file, agent = 'imports', maxBytes = maxTranscrip
     }
     const { session, pending } = entry;
     const response = responseEnvelope ?? row;
-    const model = request?.model ?? response?.model ?? response?.model_instance_id ?? row.model;
-    if (model) session.model = model;
+    const model = assignSessionModel(
+      session,
+      request?.model ?? response?.model ?? response?.model_instance_id ?? row.model,
+    );
     const ts = importedTimestamp(
       row.timestamp,
       row.ts,

@@ -31,9 +31,9 @@ session
     └── tool call + result + outcome + duration
 ```
 
-Malformed records are skipped and counted. IDs, counters, timestamps, strings,
-nesting depth, files, events, and sessions are bounded before they reach the
-browser.
+Malformed records are skipped and counted. IDs, model and tool names, counters,
+timestamps, analytics paths, files, events, and sessions are bounded before
+analysis.
 
 ### 3. Analysis
 
@@ -58,9 +58,11 @@ origins.
 
 Dashboard responses contain hashed public session keys, generic labels, and
 redacted content. Raw trajectory data is returned only after an authenticated,
-explicit reveal request. Responses use a restrictive Content Security Policy,
-same-origin isolation headers, no-referrer policy, and no-store caching for API
-data.
+explicit reveal request. Both views pass through the same string, collection,
+object-property, and nesting limits. Aggregate tables are capped after complete
+totals are calculated and include omission metadata. Responses use a
+restrictive Content Security Policy, same-origin isolation headers, no-referrer
+policy, and no-store caching for API data.
 
 ### 5. Interface
 

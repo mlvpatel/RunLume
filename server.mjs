@@ -29,6 +29,8 @@ const PACKAGE = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'),
 const SOURCE_NAMES = new Set(['claude-code', 'cursor', 'codex', 'gemini', 'api-log', 'hermes']);
 const SNAPSHOT_TTL_MS = 1_000;
 const API_STRING_LIMIT = 100_000;
+const API_COLLECTION_LIMIT = 250;
+const API_SESSION_LIMIT = 10_000;
 const DEFAULT_EVENT_PAGE_LIMIT = 100;
 const MAX_EVENT_PAGE_LIMIT = 250;
 const MAX_WINDOW_DAYS = 3_650;
@@ -40,6 +42,14 @@ export const DEFAULT_RESOURCE_LIMITS = Object.freeze({
   maxEvents: 1_000_000,
   maxSessions: 10_000,
   minRefreshMs: 2_000,
+});
+export const MAX_RESOURCE_LIMITS = Object.freeze({
+  maxFileBytes: 512 * 1024 * 1024,
+  maxFiles: 100_000,
+  maxTotalBytes: 8 * 1024 * 1024 * 1024,
+  maxEvents: 2_000_000,
+  maxSessions: 50_000,
+  minRefreshMs: 60 * 60 * 1000,
 });
 const STATIC_ROOT = path.join(__dirname, 'public');
 const MIME = {
@@ -78,11 +88,13 @@ function valueAfter(args, flag) {
   return value;
 }
 
-function positiveIntegerEnv(env, name, fallback, { allowZero = false } = {}) {
+function positiveIntegerEnv(env, name, fallback, { allowZero = false, maximum = Number.MAX_SAFE_INTEGER } = {}) {
   if (env[name] == null || env[name] === '') return fallback;
   const value = Number(env[name]);
   const minimum = allowZero ? 0 : 1;
-  if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`${name} must be an integer of at least ${minimum}`);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer of at least ${minimum} and at most ${maximum}`);
+  }
   return value;
 }
 
@@ -127,12 +139,12 @@ export function parseConfig(args = process.argv.slice(2), env = process.env) {
     importDir,
     sources,
     limits: {
-      maxFileBytes: positiveIntegerEnv(env, 'RUNLUME_MAX_FILE_BYTES', DEFAULT_RESOURCE_LIMITS.maxFileBytes),
-      maxFiles: positiveIntegerEnv(env, 'RUNLUME_MAX_FILES', DEFAULT_RESOURCE_LIMITS.maxFiles),
-      maxTotalBytes: positiveIntegerEnv(env, 'RUNLUME_MAX_TOTAL_BYTES', DEFAULT_RESOURCE_LIMITS.maxTotalBytes),
-      maxEvents: positiveIntegerEnv(env, 'RUNLUME_MAX_EVENTS', DEFAULT_RESOURCE_LIMITS.maxEvents),
-      maxSessions: positiveIntegerEnv(env, 'RUNLUME_MAX_SESSIONS', DEFAULT_RESOURCE_LIMITS.maxSessions),
-      minRefreshMs: positiveIntegerEnv(env, 'RUNLUME_MIN_REFRESH_MS', DEFAULT_RESOURCE_LIMITS.minRefreshMs, { allowZero: true }),
+      maxFileBytes: positiveIntegerEnv(env, 'RUNLUME_MAX_FILE_BYTES', DEFAULT_RESOURCE_LIMITS.maxFileBytes, { maximum: MAX_RESOURCE_LIMITS.maxFileBytes }),
+      maxFiles: positiveIntegerEnv(env, 'RUNLUME_MAX_FILES', DEFAULT_RESOURCE_LIMITS.maxFiles, { maximum: MAX_RESOURCE_LIMITS.maxFiles }),
+      maxTotalBytes: positiveIntegerEnv(env, 'RUNLUME_MAX_TOTAL_BYTES', DEFAULT_RESOURCE_LIMITS.maxTotalBytes, { maximum: MAX_RESOURCE_LIMITS.maxTotalBytes }),
+      maxEvents: positiveIntegerEnv(env, 'RUNLUME_MAX_EVENTS', DEFAULT_RESOURCE_LIMITS.maxEvents, { maximum: MAX_RESOURCE_LIMITS.maxEvents }),
+      maxSessions: positiveIntegerEnv(env, 'RUNLUME_MAX_SESSIONS', DEFAULT_RESOURCE_LIMITS.maxSessions, { maximum: MAX_RESOURCE_LIMITS.maxSessions }),
+      minRefreshMs: positiveIntegerEnv(env, 'RUNLUME_MIN_REFRESH_MS', DEFAULT_RESOURCE_LIMITS.minRefreshMs, { allowZero: true, maximum: MAX_RESOURCE_LIMITS.minRefreshMs }),
     },
     pricingFile: path.resolve(
       valueAfter(args, '--pricing')
@@ -286,12 +298,12 @@ function cloneForApi(value, depth = 0) {
   if (value == null || typeof value !== 'object') return value;
   if (depth >= 8) return '[maximum depth reached]';
   if (Array.isArray(value)) {
-    const kept = value.slice(0, 250).map((item) => cloneForApi(item, depth + 1));
+    const kept = value.slice(0, API_COLLECTION_LIMIT).map((item) => cloneForApi(item, depth + 1));
     if (value.length > kept.length) kept.push(`… [truncated ${value.length - kept.length} items]`);
     return kept;
   }
   return Object.fromEntries(
-    Object.entries(value).slice(0, 250).map(([key, item]) => [key, cloneForApi(item, depth + 1)]),
+    Object.entries(value).slice(0, API_COLLECTION_LIMIT).map(([key, item]) => [key, cloneForApi(item, depth + 1)]),
   );
 }
 
@@ -327,6 +339,13 @@ function redactedEvent(event) {
 
 function safeSessionSummary(session, pricing, revealSensitive = false, analysis = null) {
   const summary = sessionSummary(session, pricing, false, analysis);
+  const toolCounts = Object.entries(summary.stats.toolCounts ?? {});
+  summary.stats = {
+    ...summary.stats,
+    toolCounts: Object.fromEntries(toolCounts.slice(0, API_COLLECTION_LIMIT)),
+    toolNamesOmitted: Math.max(0, toolCounts.length - API_COLLECTION_LIMIT),
+    toolCallsTotal: toolCounts.reduce((total, [, count]) => total + Number(count || 0), 0),
+  };
   if (revealSensitive) return summary;
   const id = redactedSessionId(session);
   return {
@@ -353,8 +372,8 @@ export function sessionPageForApi(session, pricing, {
   const total = session.events.length;
   const events = session.events
     .slice(offset, offset + limit)
-    .map((event) => cloneForApi(revealSensitive ? event : redactedEvent(event)));
-  return {
+    .map((event) => (revealSensitive ? event : redactedEvent(event)));
+  return cloneForApi({
     ...safeSessionSummary(session, pricing, revealSensitive, analysis),
     sensitiveContentRevealed: revealSensitive,
     events,
@@ -366,25 +385,68 @@ export function sessionPageForApi(session, pricing, {
       nextOffset: offset + events.length < total ? offset + events.length : null,
       previousOffset: offset > 0 ? Math.max(0, offset - limit) : null,
     },
-  };
+  });
 }
 
-function redactedStats(stats) {
-  const safe = structuredClone(stats);
+function outputLimit(total, shown) {
+  return { total, shown, omitted: Math.max(0, total - shown) };
+}
+
+export function redactedStats(stats) {
+  const tools = stats.tools.slice(0, API_COLLECTION_LIMIT);
+  const models = stats.models.slice(0, API_COLLECTION_LIMIT);
+  const files = stats.impact.files.slice(0, API_COLLECTION_LIMIT);
+  const directories = stats.impact.directories.slice(0, API_COLLECTION_LIMIT);
+  const churnFiles = stats.impact.churnFiles.slice(0, API_COLLECTION_LIMIT);
+  const costSessions = stats.cost.sessions.slice(0, API_COLLECTION_LIMIT);
+  const providers = stats.providers.map((provider) => ({
+    ...provider,
+    models: provider.models.slice(0, API_COLLECTION_LIMIT),
+  }));
+  const providerModelTotal = stats.providers.reduce(
+    (total, provider) => total + provider.models.length,
+    0,
+  );
+  const providerModelShown = providers.reduce(
+    (total, provider) => total + provider.models.length,
+    0,
+  );
+  const safe = structuredClone({
+    ...stats,
+    tools,
+    models,
+    impact: { ...stats.impact, files, directories, churnFiles },
+    providers,
+    cost: { ...stats.cost, sessions: costSessions },
+    outputLimits: {
+      maxRowsPerCollection: API_COLLECTION_LIMIT,
+      tools: outputLimit(stats.tools.length, tools.length),
+      models: outputLimit(stats.models.length, models.length),
+      files: outputLimit(stats.impact.files.length, files.length),
+      directories: outputLimit(stats.impact.directories.length, directories.length),
+      churnFiles: outputLimit(stats.impact.churnFiles.length, churnFiles.length),
+      costSessions: outputLimit(stats.cost.sessions.length, costSessions.length),
+      providerModels: outputLimit(providerModelTotal, providerModelShown),
+    },
+  });
   const directoryLabels = new Map();
-  safe.impact.files.forEach((file, index) => {
+  const fileLabels = new Map();
+  const redactFile = (file) => {
+    const fileKey = `${file.project ?? ''}\0${file.path}`;
+    if (!fileLabels.has(fileKey)) fileLabels.set(fileKey, `File ${fileLabels.size + 1}`);
     if (!directoryLabels.has(file.directory)) {
       directoryLabels.set(file.directory, `Directory ${directoryLabels.size + 1}`);
     }
-    file.path = `File ${index + 1}`;
+    file.path = fileLabels.get(fileKey);
     file.directory = directoryLabels.get(file.directory);
     delete file.project;
-  });
+  };
+  safe.impact.files.forEach(redactFile);
+  safe.impact.churnFiles.forEach(redactFile);
   safe.impact.directories.forEach((directory, index) => {
     directory.path = `Directory ${index + 1}`;
     delete directory.project;
   });
-  safe.impact.churnFiles = safe.impact.files.filter((file) => file.sessions > 1 || file.churn > 1);
   safe.cost.sessions.forEach((session, index) => {
     session.id = `session-${index + 1}`;
     session.label = `Session ${index + 1}`;
@@ -398,7 +460,8 @@ function redactedStats(stats) {
 
 function apiSessionSummary(session) {
   const id = redactedSessionId(session);
-  return {
+  const toolCounts = Object.entries(session.stats.toolCounts ?? {});
+  return cloneForApi({
     key: session.key,
     id,
     source: session.source,
@@ -411,8 +474,21 @@ function apiSessionSummary(session) {
     endedAt: session.endedAt,
     parent: session.parent,
     children: session.children,
-    stats: session.stats,
+    stats: {
+      ...session.stats,
+      toolCounts: Object.fromEntries(toolCounts.slice(0, API_COLLECTION_LIMIT)),
+      toolNamesOmitted: Math.max(0, toolCounts.length - API_COLLECTION_LIMIT),
+      toolCallsTotal: toolCounts.reduce((total, [, count]) => total + Number(count || 0), 0),
+    },
     eventCount: session.events.length,
+  });
+}
+
+function sessionsForApi(sessions) {
+  const shown = sessions.slice(0, API_SESSION_LIMIT);
+  return {
+    sessions: shown.map((session) => apiSessionSummary(session)),
+    sessionOutput: outputLimit(sessions.length, shown.length),
   };
 }
 
@@ -468,12 +544,20 @@ export function createDashboard({
   }
   const limits = { ...DEFAULT_RESOURCE_LIMITS, ...(config.limits ?? {}) };
   for (const name of ['maxFileBytes', 'maxFiles', 'maxTotalBytes', 'maxEvents', 'maxSessions']) {
-    if (!Number.isSafeInteger(limits[name]) || limits[name] < 1) {
-      throw new Error(`createDashboard requires ${name} to be a positive safe integer`);
+    if (
+      !Number.isSafeInteger(limits[name])
+      || limits[name] < 1
+      || limits[name] > MAX_RESOURCE_LIMITS[name]
+    ) {
+      throw new Error(`createDashboard requires ${name} to be a positive integer no greater than ${MAX_RESOURCE_LIMITS[name]}`);
     }
   }
-  if (!Number.isSafeInteger(limits.minRefreshMs) || limits.minRefreshMs < 0) {
-    throw new Error('createDashboard requires minRefreshMs to be a non-negative safe integer');
+  if (
+    !Number.isSafeInteger(limits.minRefreshMs)
+    || limits.minRefreshMs < 0
+    || limits.minRefreshMs > MAX_RESOURCE_LIMITS.minRefreshMs
+  ) {
+    throw new Error(`createDashboard requires minRefreshMs to be from 0 to ${MAX_RESOURCE_LIMITS.minRefreshMs}`);
   }
   const adapters = makeAdapters({
     hermesDir: config.hermesDir,
@@ -826,6 +910,7 @@ export function createDashboard({
 
       if (url.pathname === '/api/dashboard') {
         const state = filteredState(source, force);
+        const apiSessions = sessionsForApi(state.sessions);
         return json(res, {
           roots: redactedRoots(state.roots),
           sources: adapters.map((adapter) => adapter.source),
@@ -833,7 +918,7 @@ export function createDashboard({
           revision: state.revision,
           diagnostics: redactedDiagnostics(state.diagnostics),
           generatedAt: new Date().toISOString(),
-          sessions: state.sessions.map((session) => apiSessionSummary(session)),
+          ...apiSessions,
           stats: redactedStats(buildStats(state.sessions, {
             days: config.days,
             pricing: state.pricing,
@@ -843,6 +928,7 @@ export function createDashboard({
       }
       if (url.pathname === '/api/state') {
         const state = filteredState(source, force);
+        const apiSessions = sessionsForApi(state.sessions);
         return json(res, {
           roots: redactedRoots(state.roots),
           sources: adapters.map((adapter) => adapter.source),
@@ -850,7 +936,7 @@ export function createDashboard({
           revision: state.revision,
           diagnostics: redactedDiagnostics(state.diagnostics),
           generatedAt: new Date().toISOString(),
-          sessions: state.sessions.map((session) => apiSessionSummary(session)),
+          ...apiSessions,
         }, 200, headOnly);
       }
       if (url.pathname === '/api/stats') {

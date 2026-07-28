@@ -118,6 +118,11 @@ test('extractEditOperations understands Cursor StrReplace and Write fields', () 
     deletions: 0,
     estimated: true,
   }]);
+  assert.deepEqual(extractEditOperations(tool('Edit', {
+    file_path: `/workspace/project/${'x'.repeat(5000)}.js`,
+    old_string: 'old',
+    new_string: 'new',
+  }), '/workspace/project'), []);
 });
 
 test('replacement diffs count only changed lines and normalize project-relative paths', () => {
@@ -344,7 +349,7 @@ test('file impact is isolated by project and uses unique session keys', () => {
   assert.equal(projectTwoRow.edits, 1);
 });
 
-test('project identity is platform-neutral and normalises Windows paths', () => {
+test('project identity is platform-neutral and normalizes Windows paths', () => {
   const first = makeSession({
     key: 'codex:windows-one',
     cwd: 'C:\\Work\\RunLume',
@@ -513,6 +518,40 @@ test('pricing validation rejects malformed aliases and future model versions rem
     effectiveFrom: '2026-02-30',
     models: [{ id: 'dated', models: ['dated'], input: 1, output: 1 }],
   }).some((issue) => issue.includes('valid YYYY-MM-DD')));
+  assert.ok(validatePricing({
+    currency: 'USD',
+    models: [
+      { id: 'first', models: ['overlap-model'], effectiveTo: '2026-08-01', input: 1, output: 1 },
+      { id: 'second', models: ['overlap-model'], effectiveFrom: '2026-07-01', input: 2, output: 2 },
+    ],
+  }).some((issue) => issue.includes('overlaps')));
+  assert.deepEqual(validatePricing({
+    currency: 'USD',
+    models: [
+      { id: 'first', models: ['adjacent-model'], effectiveTo: '2026-08-01', input: 1, output: 1 },
+      { id: 'second', models: ['adjacent-model'], effectiveFrom: '2026-08-01', input: 2, output: 2 },
+      { id: 'codex-only', source: 'codex', models: ['scoped-model'], input: 1, output: 1 },
+      { id: 'gemini-only', source: 'gemini', models: ['scoped-model'], input: 2, output: 2 },
+    ],
+  }), []);
+  assert.ok(validatePricing({
+    currency: 'USD',
+    models: [
+      { id: 'global', models: ['global-model'], input: 1, output: 1 },
+      { id: 'scoped', source: 'codex', models: ['global-model'], input: 2, output: 2 },
+    ],
+  }).some((issue) => issue.includes('overlaps')));
+  assert.ok(validatePricing({
+    currency: 'USD',
+    models: [
+      { id: 'dated-base', models: ['dated-model'], allowDatedSuffix: true, input: 1, output: 1 },
+      { id: 'dated-exact', models: ['dated-model-20260729'], input: 2, output: 2 },
+    ],
+  }).some((issue) => issue.includes('overlaps')));
+  assert.ok(validatePricing({
+    currency: 'USD',
+    models: [{ id: 'bad-source', source: '../codex', models: ['safe-model'], input: 1, output: 1 }],
+  }).some((issue) => issue.includes('source identifier')));
   for (const model of ['claude-opus-4-9', 'claude-sonnet-4-7', 'claude-haiku-999']) {
     assert.equal(priceSession(makeSession({ source: 'claude-code', model }), pricing).total, null);
   }

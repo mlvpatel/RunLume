@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/mlvpatel/RunLume/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/mlvpatel/RunLume/actions/workflows/ci.yml/badge.svg" /></a>
-  <a href="https://nodejs.org/"><img alt="Node.js 22 or newer" src="https://img.shields.io/badge/Node.js-22%2B-1f6f43?logo=node.js&logoColor=white" /></a>
+  <a href="https://nodejs.org/"><img alt="Node.js 22 and 24 LTS" src="https://img.shields.io/badge/Node.js-22%20%7C%2024-1f6f43?logo=node.js&logoColor=white" /></a>
   <a href="./package.json"><img alt="Zero runtime dependencies" src="https://img.shields.io/badge/runtime_dependencies-0-1d1d1f" /></a>
   <a href="./LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-0066cc" /></a>
 </p>
@@ -56,8 +56,8 @@ correctness, or code authorship.
 
 ## Quick start
 
-Requirements: Node.js 22 or 24. RunLume has no runtime dependencies and no build
-step.
+Requirements: Node.js 22 or 24 LTS. Node.js 26 is tested for forward
+compatibility. RunLume has no runtime dependencies and no build step.
 
 ```bash
 git clone https://github.com/mlvpatel/RunLume.git
@@ -153,7 +153,8 @@ RunLume is designed for one trusted user on one machine:
 - redacts transcript content and local identifiers by default;
 - reads agent state without modifying it;
 - rejects symbolic links and paths outside configured roots;
-- bounds file size, total bytes, files, events, sessions, API strings, and refresh rate;
+- bounds file size, total bytes, files, events, sessions, identifiers, API
+  strings and collections, and refresh rate;
 - ships no telemetry, cloud database, analytics SDK, or runtime package dependency.
 
 Do not expose the port through a tunnel, proxy, container publication, or
@@ -175,6 +176,8 @@ fields.
 The default window is 30 days. Complete qualifying sessions are analyzed so
 totals remain internally consistent. In all-history mode, totals include every
 accepted session while daily charts show at most the latest 730 active days.
+When a browser table reaches its output cap, RunLume shows the omitted-row count
+while keeping complete aggregate totals.
 
 ## Develop and verify
 

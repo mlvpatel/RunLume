@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.1 - 2026-07-29
+
+- Bounded tool and model identifiers at ingestion, protected tool counters from
+  prototype-key collisions, and rejected analytics paths beyond the documented
+  limit.
+- Capped every aggregate collection sent to the browser, exposed omission
+  counts without changing complete totals, and made deep session-tree rendering
+  iterative and cycle-tolerant.
+- Rejected overlapping pricing periods, including global versus source-scoped
+  rows and exact aliases covered by dated-suffix rules.
+- Added hard ceilings for configurable scan budgets, expanded hostile-input and
+  output-bound regression coverage, and shipped the public documentation and
+  favicon in the installable package.
+- Avoided duplicate CI runs by reserving push workflows for `main` and release
+  tags while pull requests retain the complete release matrix.
+- Clarified the maintained Node.js release lines and completed the public
+  repository security and release workflow.
+
 ## 0.3.0 - 2026-07-29
 
 - Added explicit provider attribution and opt-in import identities for NVIDIA
@@ -62,7 +80,7 @@
   source filters, synthetic fixtures, and Standard text API pricing where a
   single unambiguous rate is available.
 - Added first-class Cursor discovery, native IDE and CLI `stream-json` parsing,
-  dynamic and built-in tool normalisation, failed-turn reporting, parsed
+  dynamic and built-in tool normalization, failed-turn reporting, parsed
   `StrReplace`/`Write` impact, duplicate-session suppression, sub-agent
   relationships, source filters, synthetic fixtures, and documented native
   timestamp/token limitations.
@@ -107,7 +125,7 @@
 - Added a packed-artifact smoke test that installs and executes the published
   command, including symlink-safe CLI entry-point detection.
 
-## 0.3.0 (2026-07-24)
+## 0.2.1 - 2026-07-24
 
 - Hardened the localhost server against DNS rebinding and unsafe embedding.
 - Added validated CLI options, graceful server errors, and bounded API output.
@@ -115,7 +133,7 @@
 - Added collision-resistant public session keys and deterministic graph rebuilds.
 - Added parser diagnostics, transcript size limits, and structured Codex errors.
 - Replaced gross replacement-line counts with bounded minimal line diffs.
-- Fixed rename/delete patch accounting and normalised paths relative to session roots.
+- Fixed rename/delete patch accounting and normalized paths relative to session roots.
 - Tightened pricing patterns, added current model rows, and added token coverage.
 - Consolidated frontend refreshes into one snapshot API with error handling.
 - Added accessible data tables, modal focus management, and tablist keyboard support.

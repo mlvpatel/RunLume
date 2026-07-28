@@ -56,6 +56,9 @@ try {
   const server = path.join(installedRoot, 'server.mjs');
   assert.equal(fs.existsSync(server), true, 'installed package must contain server.mjs');
   assert.equal(fs.existsSync(path.join(installedRoot, 'public', 'index.html')), true);
+  assert.equal(fs.existsSync(path.join(installedRoot, 'public', 'favicon.svg')), true);
+  assert.equal(fs.existsSync(path.join(installedRoot, 'docs', 'architecture.md')), true);
+  assert.equal(fs.existsSync(path.join(installedRoot, 'docs', 'reference.md')), true);
   assert.equal(fs.existsSync(path.join(installedRoot, 'test')), false, 'tests must not ship');
 
   const version = spawnSync(process.execPath, [server, '--version'], { encoding: 'utf8' });

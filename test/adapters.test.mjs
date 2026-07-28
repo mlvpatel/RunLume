@@ -146,6 +146,37 @@ test('usage counters coerce numeric strings and reject invalid or negative value
   });
 });
 
+test('tool and model identifiers are bounded and cannot corrupt counters', (t) => {
+  const longName = `tool-${'x'.repeat(300)}`;
+  const longModel = `model-${'y'.repeat(300)}`;
+  const file = fixture(t, 'bounded-identifiers.jsonl', [
+    { type: 'session', id: 'bounded-identifiers', timestamp: '2026-07-20T10:00:00Z' },
+    {
+      type: 'message',
+      timestamp: '2026-07-20T10:00:01Z',
+      message: {
+        role: 'assistant',
+        model: longModel,
+        usage: { input_tokens: 10, output_tokens: 2 },
+        content: [
+          { type: 'toolCall', id: 'call-1', name: '__proto__', arguments: {} },
+          { type: 'toolCall', id: 'call-2', name: 'constructor', arguments: {} },
+          { type: 'toolCall', id: 'call-3', name: longName, arguments: {} },
+        ],
+      },
+    },
+  ]);
+
+  const session = parseGenericAgentFile('hermes', file, 'main').sessions[0];
+  assert.equal(Object.getPrototypeOf(session.stats.toolCounts), null);
+  assert.equal(session.stats.toolCounts.__proto__, 1);
+  assert.equal(session.stats.toolCounts.constructor, 1);
+  assert.equal(Object.keys(session.stats.toolCounts).length, 3);
+  assert.equal(session.events.at(-1).tool.name.length, 160);
+  assert.equal(session.model.length, 160);
+  assert.equal(session.usage[0].model.length, 160);
+});
+
 test('Claude Code parser creates intrinsic sidechain relationships', (t) => {
   const file = fixture(t, 'claude.jsonl', [
     {
@@ -619,7 +650,7 @@ test('Hermes adapter discovers nested JSONL fixtures inside its configured root'
   assert.equal(adapter.parseFile(files[0]).sessions[0].source, 'hermes');
 });
 
-test('API log importer normalises OpenAI, Anthropic, Ollama, and LM Studio sessions', () => {
+test('API log importer normalizes OpenAI, Anthropic, Ollama, and LM Studio sessions', () => {
   const result = parseApiLogFile(API_LOG_FIXTURE);
   assert.equal(result.sessions.length, 4);
   assert.equal(result.diagnostics.malformedLines, 0);
