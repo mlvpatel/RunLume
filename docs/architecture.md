@@ -51,10 +51,13 @@ never runs transcript commands or patches.
 
 ### 4. API boundary
 
-`server.mjs` creates one random token per launch and binds to `127.0.0.1`.
-Every `/api/` request requires that token. Host and Origin validation rejects
-non-loopback names, user-info tricks, malformed hosts, wrong ports, and non-HTTP
-origins.
+`server.mjs` creates one random capability per launch and binds to `127.0.0.1`.
+A direct document navigation receives a browser-specific capability in an
+`HttpOnly`, `SameSite=Strict` session cookie. It is derived from the raw API
+token with HMAC, so the raw token is never stored in the cookie, read by
+JavaScript, or logged. Every `/api/` request requires that cookie or an explicit
+Bearer token. Host and Origin validation rejects non-loopback names, user-info
+tricks, malformed hosts, wrong ports, and non-HTTP origins.
 
 Dashboard responses contain hashed public session keys, generic labels, and
 redacted content. Raw trajectory data is returned only after an authenticated,
@@ -67,9 +70,8 @@ policy, and no-store caching for API data.
 ### 5. Interface
 
 `public/` contains plain HTML, CSS, JavaScript, and inline SVG charts. It has no
-runtime package dependency or remote script. The browser removes the launch
-token from the address bar, keeps it in tab-scoped storage, and attaches it to
-API requests.
+runtime package dependency or remote script. The browser sends the protected
+session cookie only to the same-origin loopback server.
 
 The interface includes keyboard navigation, visible focus, reduced-motion
 handling, responsive layouts, chart data tables, focus-managed dialogs, and

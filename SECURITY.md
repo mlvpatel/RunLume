@@ -19,8 +19,11 @@ state directory.
 
 The dashboard reads sensitive agent transcripts and intentionally serves them
 only on the loopback interface. It rejects non-local Host and Origin values,
-requires a random per-launch Bearer token for API requests, and redacts
-transcript content by default. Do not expose its port through a reverse proxy,
+requires a browser-specific capability delivered in an `HttpOnly`,
+`SameSite=Strict` session cookie for browser API requests, and redacts transcript
+content by default. The cookie capability is HMAC-derived from the random
+per-launch API token; the raw token is not written to a URL, cookie, browser
+storage, or terminal log. Do not expose the port through a reverse proxy,
 tunnel, container port publication, or network-forwarding rule without adding
 transport security and reviewing the authentication boundary.
 

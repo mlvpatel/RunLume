@@ -24,17 +24,6 @@ let state = {
 let stats = null;
 let selected = null;
 let sourceFilter = storageGet('localStorage', 'runlume-source') || 'all';
-const TOKEN_STORAGE_KEY = 'runlume-token';
-const fragment = new URLSearchParams(location.hash.replace(/^#/, ''));
-const fragmentToken = fragment.get('token');
-if (fragmentToken && /^[A-Za-z0-9_-]{32,}$/.test(fragmentToken)) {
-  storageSet('sessionStorage', TOKEN_STORAGE_KEY, fragmentToken);
-  try { history.replaceState(null, '', `${location.pathname}${location.search}`); }
-  catch { /* the token is still kept in tab storage when available */ }
-}
-const apiToken = /^[A-Za-z0-9_-]{32,}$/.test(fragmentToken ?? '')
-  ? fragmentToken
-  : storageGet('sessionStorage', TOKEN_STORAGE_KEY);
 const SOURCE_LABEL = { 'claude-code': 'Claude Code', cursor: 'Cursor', codex: 'Codex', gemini: 'Gemini', 'api-log': 'API & Local Logs', hermes: 'Hermes' };
 const sourceLabel = (s) => (s === 'all' ? 'Agents' : SOURCE_LABEL[s] || s);
 const sourceShort = { 'claude-code': 'Claude', cursor: 'Cursor', codex: 'Codex', gemini: 'Gemini', 'api-log': 'Imported', hermes: 'Hermes' };
@@ -123,21 +112,24 @@ const DOW_FULL = ['Sundays', 'Mondays', 'Tuesdays', 'Wednesdays', 'Thursdays', '
 
 // ── data loading ─────────────────────────────────────────────────
 function apiFetch(url, options = {}) {
-  if (!apiToken) {
-    const message = location.protocol === 'file:'
-      ? 'Open this dashboard through the local server. Run npm start and use the authenticated URL printed in the terminal.'
-      : 'The dashboard access token is missing. Restart the server and open the complete authenticated URL printed in the terminal.';
-    return Promise.reject(new Error(message));
+  if (location.protocol === 'file:') {
+    return Promise.reject(new Error(
+      'Open this dashboard through the local server. Run npm start and use the URL printed in the terminal.',
+    ));
   }
   const headers = new Headers(options.headers);
-  headers.set('Authorization', `Bearer ${apiToken}`);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(new Error('dashboard request timed out')), 60_000);
   if (options.signal) {
     if (options.signal.aborted) controller.abort(options.signal.reason);
     else options.signal.addEventListener('abort', () => controller.abort(options.signal.reason), { once: true });
   }
-  return fetch(url, { ...options, headers, signal: controller.signal })
+  return fetch(url, {
+    ...options,
+    credentials: 'same-origin',
+    headers,
+    signal: controller.signal,
+  })
     .finally(() => clearTimeout(timeout));
 }
 

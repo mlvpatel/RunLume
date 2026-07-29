@@ -7,6 +7,7 @@ import path from 'node:path';
 import {
   createDashboard,
   isAuthorized,
+  isRequestAuthorized,
   isAllowedHost,
   isAllowedOrigin,
   isRealPathWithin,
@@ -98,6 +99,8 @@ test('Bearer authentication uses the per-launch capability token', () => {
   assert.equal(isAuthorized(`Bearer ${'b'.repeat(43)}`, token), false);
   assert.equal(isAuthorized(token, token), false);
   assert.equal(isAuthorized(null, token), false);
+  assert.equal(isRequestAuthorized({ cookie: `other=value; runlume_access=${token}` }, token), false);
+  assert.equal(isRequestAuthorized({ cookie: 'runlume_access=invalid!' }, token), false);
 });
 
 test('latest activity calculation remains stack safe for large sessions', () => {
@@ -467,6 +470,17 @@ test('HTTP API emits security headers and rejects mutations', async (t) => {
   const response = await fetch(`http://127.0.0.1:${port}/api/dashboard`);
   assert.equal(response.status, 401);
   assert.match(response.headers.get('www-authenticate'), /^Bearer /);
+
+  const bootstrap = await fetch(`http://127.0.0.1:${port}/`);
+  assert.equal(bootstrap.status, 200);
+  const setCookie = bootstrap.headers.get('set-cookie');
+  assert.match(setCookie, /^runlume_access=[A-Za-z0-9_-]+; HttpOnly; SameSite=Strict; Path=\/$/);
+  assert.equal(setCookie.includes(dashboard.apiToken), false);
+  const cookie = setCookie.split(';', 1)[0];
+  const cookieAuthenticated = await fetch(`http://127.0.0.1:${port}/api/dashboard`, {
+    headers: { Cookie: cookie },
+  });
+  assert.equal(cookieAuthenticated.status, 200);
 
   const headers = { Authorization: `Bearer ${dashboard.apiToken}` };
   const authenticated = await fetch(`http://127.0.0.1:${port}/api/dashboard`, { headers });

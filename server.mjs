@@ -31,6 +31,7 @@ const SNAPSHOT_TTL_MS = 1_000;
 const API_STRING_LIMIT = 100_000;
 const API_COLLECTION_LIMIT = 250;
 const API_SESSION_LIMIT = 10_000;
+const ACCESS_COOKIE = 'runlume_access';
 const DEFAULT_EVENT_PAGE_LIMIT = 100;
 const MAX_EVENT_PAGE_LIMIT = 250;
 const MAX_WINDOW_DAYS = 3_650;
@@ -514,6 +515,40 @@ export function isAuthorized(authorization, token) {
   return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
 }
 
+function cookieValue(cookieHeader, name) {
+  if (typeof cookieHeader !== 'string') return null;
+  for (const part of cookieHeader.split(';')) {
+    const separator = part.indexOf('=');
+    if (separator < 0 || part.slice(0, separator).trim() !== name) continue;
+    const value = part.slice(separator + 1).trim();
+    return /^[A-Za-z0-9_-]+$/.test(value) ? value : null;
+  }
+  return null;
+}
+
+function browserCookieToken(token) {
+  return crypto.createHmac('sha256', token)
+    .update('runlume-browser-session-v1')
+    .digest('base64url');
+}
+
+export function isRequestAuthorized(headers, token) {
+  if (isAuthorized(headers?.authorization, token)) return true;
+  const cookieToken = cookieValue(headers?.cookie, ACCESS_COOKIE);
+  return cookieToken
+    ? isAuthorized(`Bearer ${cookieToken}`, browserCookieToken(token))
+    : false;
+}
+
+function isDocumentNavigation(req) {
+  const mode = req.headers['sec-fetch-mode'];
+  const destination = req.headers['sec-fetch-dest'];
+  return req.method === 'GET'
+    && !req.headers.origin
+    && (destination == null || destination === 'document')
+    && (mode == null || mode === 'navigate' || destination == null);
+}
+
 function paginationFrom(url) {
   const parse = (name, fallback, { min, max }) => {
     const value = url.searchParams.get(name);
@@ -888,7 +923,7 @@ export function createDashboard({
         return json(res, { error: 'forbidden host or origin' }, 403, headOnly);
       }
       const url = new URL(req.url ?? '/', `http://127.0.0.1:${config.port}`);
-      if (url.pathname.startsWith('/api/') && !isAuthorized(req.headers.authorization, apiToken)) {
+      if (url.pathname.startsWith('/api/') && !isRequestAuthorized(req.headers, apiToken)) {
         res.setHeader('WWW-Authenticate', 'Bearer realm="runlume"');
         return json(res, { error: 'authentication required' }, 401, headOnly);
       }
@@ -988,10 +1023,14 @@ export function createDashboard({
         && isRealPathWithin(STATIC_ROOT, filePath)
       ) {
         const body = fs.readFileSync(filePath);
-        res.writeHead(200, {
+        const headers = {
           ...securityHeaders(MIME[path.extname(filePath)] ?? 'application/octet-stream', 'no-cache'),
           'Content-Length': body.length,
-        });
+        };
+        if (relative === 'index.html' && isDocumentNavigation(req)) {
+          headers['Set-Cookie'] = `${ACCESS_COOKIE}=${browserCookieToken(apiToken)}; HttpOnly; SameSite=Strict; Path=/`;
+        }
+        res.writeHead(200, headers);
         return res.end(headOnly ? undefined : body);
       }
       return json(res, { error: 'not found' }, 404, headOnly);
@@ -1021,7 +1060,7 @@ export function start(config, logger = console) {
     const state = dashboard.getState(true);
     const bySource = {};
     for (const session of state.sessions) bySource[session.source] = (bySource[session.source] || 0) + 1;
-    logger.log(`RunLume running at http://127.0.0.1:${config.port}/#token=${dashboard.apiToken}`);
+    logger.log(`RunLume running at http://127.0.0.1:${config.port}/`);
     logger.log(`sources: ${dashboard.adapters.map((adapter) => adapter.source).join(', ')} | window: ${Number.isFinite(config.days) ? `sessions active in the last ${config.days} days` : 'all history'}`);
     logger.log(`sessions: ${state.sessions.length} ${JSON.stringify(bySource)} (initial scan ${Date.now() - started}ms)`);
     if (!state.sessions.length) logger.log('No sessions found. Run "npm run sample" for demo data, or pass --all to scan all history.');

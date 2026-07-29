@@ -55,7 +55,7 @@ function startServer() {
     const timer = setTimeout(() => reject(new Error('RunLume did not start within 10 seconds')), 10_000);
     const inspect = (chunk) => {
       output += String(chunk);
-      const match = output.match(new RegExp(`http://127\\.0\\.0\\.1:${capturePort}/#token=[A-Za-z0-9_-]+`));
+      const match = output.match(new RegExp(`http://127\\.0\\.0\\.1:${capturePort}/`));
       if (!match) return;
       clearTimeout(timer);
       resolve(match[0]);

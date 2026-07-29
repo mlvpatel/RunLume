@@ -10,7 +10,6 @@ import { createDashboard } from '../../server.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const PRICING_FILE = path.join(ROOT, 'pricing.json');
-const API_TOKEN = 'e2e_dashboard_token_0123456789_ABCDEFGHIJK';
 const BROWSERS = { chromium, firefox, webkit };
 
 function fixtureRows() {
@@ -103,7 +102,7 @@ async function startFixtureDashboard(t) {
       sources: ['gemini', 'hermes'],
       pricingFile: PRICING_FILE,
     },
-    apiToken: API_TOKEN,
+    apiToken: 'e2e_dashboard_token_0123456789_ABCDEFGHIJK',
     logger: { log() {}, warn() {}, error() {} },
   });
   await new Promise((resolve, reject) => {
@@ -151,7 +150,7 @@ async function verifyBrowser(browserName, browserType, baseUrl) {
     });
     page.on('pageerror', (error) => errors.push(error.message));
 
-    await page.goto(`${baseUrl}/#token=${API_TOKEN}`);
+    await page.goto(`${baseUrl}/`);
     await page.waitForFunction(
       () => document.querySelector('#main .hero') || document.querySelector('#roots.load-error'),
       null,
@@ -247,7 +246,7 @@ async function verifyBrowser(browserName, browserType, baseUrl) {
       reducedMotion: 'reduce',
     });
     const mobilePage = await mobile.newPage();
-    await mobilePage.goto(`${baseUrl}/#token=${API_TOKEN}`);
+    await mobilePage.goto(`${baseUrl}/`);
     await mobilePage.waitForFunction(
       () => document.querySelector('#main .hero') || document.querySelector('#roots.load-error'),
       null,
@@ -301,7 +300,7 @@ async function verifyBrowser(browserName, browserType, baseUrl) {
       reducedMotion: 'reduce',
     });
     const landscapePage = await landscape.newPage();
-    await landscapePage.goto(`${baseUrl}/#token=${API_TOKEN}`);
+    await landscapePage.goto(`${baseUrl}/`);
     await landscapePage.waitForFunction(
       () => document.querySelector('#main .hero') || document.querySelector('#roots.load-error'),
       null,

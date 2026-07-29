@@ -65,14 +65,16 @@ cd RunLume
 npm start
 ```
 
-Open the authenticated URL printed in the terminal:
+Open the local URL printed in the terminal:
 
 ```text
-http://127.0.0.1:4477/#token=<per-launch-token>
+http://127.0.0.1:4477/
 ```
 
-The token moves from the URL fragment into tab-scoped storage and is sent as a
-Bearer token for API requests. A server restart invalidates it.
+The first document response creates an `HttpOnly`, `SameSite=Strict` session
+cookie containing a browser-specific capability derived with HMAC from the
+per-launch secret. JavaScript cannot read it, the raw API token is never placed
+in the cookie, and a server restart invalidates it.
 
 To explore without any installed agent CLI:
 
@@ -83,7 +85,7 @@ npm run sample
 The sample includes synthetic edits, a correction, an abandoned run, a failed
 tool call, and observed model identifiers from several providers. Opening
 `public/index.html` directly will not load data; the dashboard needs the local
-server and its access token.
+server and its secure session cookie.
 
 ## How it works
 

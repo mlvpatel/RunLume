@@ -36,7 +36,7 @@
     <g transform="translate(1086 210)" filter="url(#shadow)">
       <rect width="238" height="336" rx="24" fill="#1d1d1f"/><rect x="22" y="22" width="54" height="54" rx="15" fill="#27364a"/><path d="M38 47h22v15H38zM42 47v-6a7 7 0 0114 0v6" fill="none" stroke="#76b9ff" stroke-width="2.5"/>
       <text x="22" y="108" fill="#ffffff" font-size="23" font-weight="700">Serve</text><text x="22" y="140" fill="#b7c4d4" font-size="15">server.mjs + public/</text>
-      <text x="22" y="176" fill="#edf4ff" font-size="15">127.0.0.1 only</text><text x="22" y="204" fill="#edf4ff" font-size="15">Per-launch Bearer token</text><text x="22" y="232" fill="#edf4ff" font-size="15">Redacted by default</text><text x="22" y="260" fill="#edf4ff" font-size="15">Accessible dashboard</text>
+      <text x="22" y="176" fill="#edf4ff" font-size="15">127.0.0.1 only</text><text x="22" y="204" fill="#edf4ff" font-size="15">HttpOnly session cookie</text><text x="22" y="232" fill="#edf4ff" font-size="15">Redacted by default</text><text x="22" y="260" fill="#edf4ff" font-size="15">Accessible dashboard</text>
       <rect x="22" y="286" width="194" height="28" rx="14" fill="#27364a"/><text x="35" y="305" fill="#9dccff" font-size="13" font-weight="650">no telemetry · no cloud DB</text>
     </g>
   </g>

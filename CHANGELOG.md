@@ -15,6 +15,11 @@
   favicon in the installable package.
 - Avoided duplicate CI runs by reserving push workflows for `main` and release
   tags while pull requests retain the complete release matrix.
+- Replaced the clear-text launch URL capability with an HMAC-derived,
+  browser-specific capability in an `HttpOnly`, `SameSite=Strict` session
+  cookie, resolving the CodeQL findings without exposing the raw API token.
+- Increased the secondary header label contrast to keep the Firefox axe audit
+  stable at the WCAG AA threshold.
 - Clarified the maintained Node.js release lines and completed the public
   repository security and release workflow.
 
