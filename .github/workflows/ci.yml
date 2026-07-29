@@ -61,7 +61,18 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium firefox webkit
-      - run: pnpm run test:e2e
+      - name: Test Chromium
+        run: pnpm run test:e2e
+        env:
+          E2E_BROWSER: chromium
+      - name: Test Firefox
+        run: pnpm run test:e2e
+        env:
+          E2E_BROWSER: firefox
+      - name: Test WebKit
+        run: pnpm run test:e2e
+        env:
+          E2E_BROWSER: webkit
 
   package:
     name: Packed artifact

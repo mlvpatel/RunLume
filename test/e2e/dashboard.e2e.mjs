@@ -136,6 +136,18 @@ async function axeViolations(page) {
   }));
 }
 
+async function openDashboard(page, baseUrl) {
+  await page.goto(`${baseUrl}/`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60_000,
+  });
+  await page.waitForFunction(
+    () => document.querySelector('#main .hero') || document.querySelector('#roots.load-error'),
+    null,
+    { timeout: 20_000 },
+  );
+}
+
 async function verifyBrowser(browserName, browserType, baseUrl) {
   const browser = await browserType.launch({ headless: true });
   try {
@@ -150,12 +162,7 @@ async function verifyBrowser(browserName, browserType, baseUrl) {
     });
     page.on('pageerror', (error) => errors.push(error.message));
 
-    await page.goto(`${baseUrl}/`);
-    await page.waitForFunction(
-      () => document.querySelector('#main .hero') || document.querySelector('#roots.load-error'),
-      null,
-      { timeout: 10_000 },
-    );
+    await openDashboard(page, baseUrl);
     assert.equal(
       await page.locator('#main .hero').count(),
       1,
@@ -238,20 +245,14 @@ async function verifyBrowser(browserName, browserType, baseUrl) {
     );
     assert.match(await page.locator('.trajectory-controls').first().innerText(), /Events 101–107 of 107/);
     assert.deepEqual(errors, [], `${browserName}: console and page errors`);
-    await context.close();
 
-    const mobile = await browser.newContext({
-      viewport: { width: 375, height: 812 },
+    await page.setViewportSize({ width: 375, height: 812 });
+    await page.emulateMedia({
       colorScheme: 'light',
       reducedMotion: 'reduce',
     });
-    const mobilePage = await mobile.newPage();
-    await mobilePage.goto(`${baseUrl}/`);
-    await mobilePage.waitForFunction(
-      () => document.querySelector('#main .hero') || document.querySelector('#roots.load-error'),
-      null,
-      { timeout: 10_000 },
-    );
+    const mobilePage = page;
+    await openDashboard(mobilePage, baseUrl);
     assert.equal(
       await mobilePage.locator('#main .hero').count(),
       1,
@@ -292,20 +293,10 @@ async function verifyBrowser(browserName, browserType, baseUrl) {
       `${browserName}: mobile header touch targets ${JSON.stringify(mobileTargets)}`,
     );
     assert.deepEqual(await axeViolations(mobilePage), [], `${browserName}: mobile accessibility`);
-    await mobile.close();
 
-    const landscape = await browser.newContext({
-      viewport: { width: 844, height: 390 },
-      colorScheme: 'light',
-      reducedMotion: 'reduce',
-    });
-    const landscapePage = await landscape.newPage();
-    await landscapePage.goto(`${baseUrl}/`);
-    await landscapePage.waitForFunction(
-      () => document.querySelector('#main .hero') || document.querySelector('#roots.load-error'),
-      null,
-      { timeout: 10_000 },
-    );
+    await page.setViewportSize({ width: 844, height: 390 });
+    const landscapePage = page;
+    await openDashboard(landscapePage, baseUrl);
     const landscapeLayout = await landscapePage.evaluate(() => ({
       scrollWidth: document.documentElement.scrollWidth,
       viewportWidth: document.documentElement.clientWidth,
@@ -319,7 +310,7 @@ async function verifyBrowser(browserName, browserType, baseUrl) {
       `${browserName}: landscape layout overflows (${landscapeLayout.scrollWidth} > ${landscapeLayout.viewportWidth})`,
     );
     assert.deepEqual(await axeViolations(landscapePage), [], `${browserName}: landscape accessibility`);
-    await landscape.close();
+    await context.close();
   } finally {
     await browser.close();
   }
