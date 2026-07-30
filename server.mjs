@@ -17,6 +17,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { makeAdapters } from './adapters.mjs';
 import {
   buildStats,
+  calendarWindowStart,
+  FUTURE_TIMESTAMP_TOLERANCE_MS,
   inferProvider,
   sessionIntelligence,
   sessionSummary,
@@ -31,7 +33,7 @@ const SNAPSHOT_TTL_MS = 1_000;
 const API_STRING_LIMIT = 100_000;
 const API_COLLECTION_LIMIT = 250;
 const API_SESSION_LIMIT = 10_000;
-const ACCESS_COOKIE = 'runlume_access';
+const ACCESS_COOKIE_PREFIX = 'runlume_access_';
 const DEFAULT_EVENT_PAGE_LIMIT = 100;
 const MAX_EVENT_PAGE_LIMIT = 250;
 const MAX_WINDOW_DAYS = 3_650;
@@ -89,6 +91,10 @@ function valueAfter(args, flag) {
   return value;
 }
 
+function nonEmptyEnvironmentValue(value) {
+  return typeof value === 'string' && value.trim() === '' ? null : value;
+}
+
 function positiveIntegerEnv(env, name, fallback, { allowZero = false, maximum = Number.MAX_SAFE_INTEGER } = {}) {
   if (env[name] == null || env[name] === '') return fallback;
   const value = Number(env[name]);
@@ -102,16 +108,19 @@ function positiveIntegerEnv(env, name, fallback, { allowZero = false, maximum = 
 export function parseConfig(args = process.argv.slice(2), env = process.env) {
   const valueFlags = new Set(['--days', '--sources', '--import-dir', '--pricing', '--port']);
   const booleanFlags = new Set(['--all', '--help', '--version']);
+  const seenFlags = new Set();
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
+    if (!valueFlags.has(arg) && !booleanFlags.has(arg)) throw new Error(`unknown option: ${arg}`);
+    if (seenFlags.has(arg)) throw new Error(`${arg} may only be provided once`);
+    seenFlags.add(arg);
     if (booleanFlags.has(arg)) continue;
-    if (!valueFlags.has(arg)) throw new Error(`unknown option: ${arg}`);
     if (!args[index + 1] || args[index + 1].startsWith('--')) throw new Error(`${arg} requires a value`);
     index++;
   }
   if (args.includes('--all') && args.includes('--days')) throw new Error('--all and --days cannot be used together');
 
-  const rawPort = valueAfter(args, '--port') ?? env.PORT ?? '4477';
+  const rawPort = valueAfter(args, '--port') ?? nonEmptyEnvironmentValue(env.PORT) ?? '4477';
   const port = Number(rawPort);
   if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error(`invalid port: ${rawPort}`);
 
@@ -124,10 +133,15 @@ export function parseConfig(args = process.argv.slice(2), env = process.env) {
     throw new Error(`invalid day window: ${rawDays}; expected 1-${MAX_WINDOW_DAYS}`);
   }
 
-  const rawImportDir = valueAfter(args, '--import-dir') ?? env.RUNLUME_IMPORT_DIR ?? null;
+  const rawImportDir = valueAfter(args, '--import-dir')
+    ?? nonEmptyEnvironmentValue(env.RUNLUME_IMPORT_DIR)
+    ?? null;
   const importDir = rawImportDir ? path.resolve(rawImportDir) : null;
   const rawSources = valueAfter(args, '--sources');
   const sources = rawSources ? [...new Set(rawSources.split(',').map((source) => source.trim()).filter(Boolean))] : null;
+  if (rawSources != null && sources.length === 0) {
+    throw new Error('--sources requires at least one source');
+  }
   const unknownSources = sources?.filter((source) => !SOURCE_NAMES.has(source)) ?? [];
   if (unknownSources.length) throw new Error(`unknown source${unknownSources.length === 1 ? '' : 's'}: ${unknownSources.join(', ')}`);
   if (sources?.includes('api-log') && !importDir) {
@@ -149,7 +163,7 @@ export function parseConfig(args = process.argv.slice(2), env = process.env) {
     },
     pricingFile: path.resolve(
       valueAfter(args, '--pricing')
-      ?? env.RUNLUME_PRICING
+      ?? nonEmptyEnvironmentValue(env.RUNLUME_PRICING)
       ?? path.join(__dirname, 'pricing.json'),
     ),
   };
@@ -230,16 +244,37 @@ export function isRealPathWithin(root, target) {
   }
 }
 
-export function latestSessionMs(session) {
+function* sessionTimestampValues(session) {
+  yield session.startedAt;
+  yield session.endedAt;
+  for (const event of session.events) {
+    yield event.ts;
+    if (event.kind === 'tool') yield event.tool?.resultTs;
+  }
+  for (const usage of Array.isArray(session.usage) ? session.usage : []) yield usage?.ts;
+}
+
+function parsedTimestamp(value) {
+  if (typeof value !== 'string' || !value || value.length > 128) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function latestSessionMs(session, maximum = Infinity) {
   let latest = null;
-  const consider = (value) => {
-    const parsed = Date.parse(value);
-    if (Number.isFinite(parsed) && (latest == null || parsed > latest)) latest = parsed;
-  };
-  consider(session.startedAt);
-  consider(session.endedAt);
-  for (const event of session.events) consider(event.ts);
+  for (const value of sessionTimestampValues(session)) {
+    const parsed = parsedTimestamp(value);
+    if (parsed != null && parsed <= maximum && (latest == null || parsed > latest)) latest = parsed;
+  }
   return latest;
+}
+
+function hasSessionActivityAfter(session, maximum) {
+  for (const value of sessionTimestampValues(session)) {
+    const parsed = parsedTimestamp(value);
+    if (parsed != null && parsed > maximum) return true;
+  }
+  return false;
 }
 
 function readPricingDocument(file) {
@@ -370,12 +405,13 @@ export function sessionPageForApi(session, pricing, {
   revealSensitive = false,
   analysis = null,
 } = {}) {
-  const total = session.events.length;
-  const events = session.events
+  const intel = analysis ?? sessionIntelligence(session, pricing);
+  const total = intel.events.length;
+  const events = intel.events
     .slice(offset, offset + limit)
     .map((event) => (revealSensitive ? event : redactedEvent(event)));
   return cloneForApi({
-    ...safeSessionSummary(session, pricing, revealSensitive, analysis),
+    ...safeSessionSummary(session, pricing, revealSensitive, intel),
     sensitiveContentRevealed: revealSensitive,
     events,
     page: {
@@ -395,7 +431,17 @@ function outputLimit(total, shown) {
 
 export function redactedStats(stats) {
   const tools = stats.tools.slice(0, API_COLLECTION_LIMIT);
-  const models = stats.models.slice(0, API_COLLECTION_LIMIT);
+  const modelRateTotal = stats.models.reduce(
+    (total, model) => total + (Array.isArray(model.rates) ? model.rates.length : 0),
+    0,
+  );
+  const models = stats.models.slice(0, API_COLLECTION_LIMIT).map((model) => ({
+    ...model,
+    rates: Array.isArray(model.rates)
+      ? model.rates.slice(0, API_COLLECTION_LIMIT)
+      : [],
+  }));
+  const modelRateShown = models.reduce((total, model) => total + model.rates.length, 0);
   const files = stats.impact.files.slice(0, API_COLLECTION_LIMIT);
   const directories = stats.impact.directories.slice(0, API_COLLECTION_LIMIT);
   const churnFiles = stats.impact.churnFiles.slice(0, API_COLLECTION_LIMIT);
@@ -423,6 +469,7 @@ export function redactedStats(stats) {
       maxRowsPerCollection: API_COLLECTION_LIMIT,
       tools: outputLimit(stats.tools.length, tools.length),
       models: outputLimit(stats.models.length, models.length),
+      modelRates: outputLimit(modelRateTotal, modelRateShown),
       files: outputLimit(stats.impact.files.length, files.length),
       directories: outputLimit(stats.impact.directories.length, directories.length),
       churnFiles: outputLimit(stats.impact.churnFiles.length, churnFiles.length),
@@ -432,20 +479,27 @@ export function redactedStats(stats) {
   });
   const directoryLabels = new Map();
   const fileLabels = new Map();
+  const seenFiles = new WeakSet();
+  const directoryLabel = (project, directory) => {
+    const directoryKey = `${project ?? ''}\0${directory ?? ''}`;
+    if (!directoryLabels.has(directoryKey)) {
+      directoryLabels.set(directoryKey, `Directory ${directoryLabels.size + 1}`);
+    }
+    return directoryLabels.get(directoryKey);
+  };
   const redactFile = (file) => {
+    if (seenFiles.has(file)) return;
+    seenFiles.add(file);
     const fileKey = `${file.project ?? ''}\0${file.path}`;
     if (!fileLabels.has(fileKey)) fileLabels.set(fileKey, `File ${fileLabels.size + 1}`);
-    if (!directoryLabels.has(file.directory)) {
-      directoryLabels.set(file.directory, `Directory ${directoryLabels.size + 1}`);
-    }
     file.path = fileLabels.get(fileKey);
-    file.directory = directoryLabels.get(file.directory);
+    file.directory = directoryLabel(file.project, file.directory);
     delete file.project;
   };
   safe.impact.files.forEach(redactFile);
   safe.impact.churnFiles.forEach(redactFile);
-  safe.impact.directories.forEach((directory, index) => {
-    directory.path = `Directory ${index + 1}`;
+  safe.impact.directories.forEach((directory) => {
+    directory.path = directoryLabel(directory.project, directory.path);
     delete directory.project;
   });
   safe.cost.sessions.forEach((session, index) => {
@@ -459,36 +513,37 @@ export function redactedStats(stats) {
   return safe;
 }
 
-function apiSessionSummary(session) {
+function apiSessionSummary(session, analysis = null) {
+  const summary = sessionSummary(session, null, false, analysis);
   const id = redactedSessionId(session);
-  const toolCounts = Object.entries(session.stats.toolCounts ?? {});
+  const toolCounts = Object.entries(summary.stats.toolCounts ?? {});
   return cloneForApi({
     key: session.key,
     id,
     source: session.source,
     agent: 'local agent',
     label: `Session ${id.slice(0, 8)}`,
-    model: session.model,
-    provider: inferProvider(session.model, session.source, session.provider),
-    runtime: session.runtime,
-    startedAt: session.startedAt,
-    endedAt: session.endedAt,
+    model: summary.model,
+    provider: summary.provider,
+    runtime: summary.runtime,
+    startedAt: summary.startedAt,
+    endedAt: summary.endedAt,
     parent: session.parent,
     children: session.children,
     stats: {
-      ...session.stats,
+      ...summary.stats,
       toolCounts: Object.fromEntries(toolCounts.slice(0, API_COLLECTION_LIMIT)),
       toolNamesOmitted: Math.max(0, toolCounts.length - API_COLLECTION_LIMIT),
       toolCallsTotal: toolCounts.reduce((total, [, count]) => total + Number(count || 0), 0),
     },
-    eventCount: session.events.length,
+    eventCount: summary.eventCount,
   });
 }
 
-function sessionsForApi(sessions) {
+function sessionsForApi(sessions, analysisByKey = null) {
   const shown = sessions.slice(0, API_SESSION_LIMIT);
   return {
-    sessions: shown.map((session) => apiSessionSummary(session)),
+    sessions: shown.map((session) => apiSessionSummary(session, analysisByKey?.get(session.key))),
     sessionOutput: outputLimit(sessions.length, shown.length),
   };
 }
@@ -517,13 +572,16 @@ export function isAuthorized(authorization, token) {
 
 function cookieValue(cookieHeader, name) {
   if (typeof cookieHeader !== 'string') return null;
+  let found = null;
   for (const part of cookieHeader.split(';')) {
     const separator = part.indexOf('=');
     if (separator < 0 || part.slice(0, separator).trim() !== name) continue;
+    if (found != null) return null;
     const value = part.slice(separator + 1).trim();
-    return /^[A-Za-z0-9_-]+$/.test(value) ? value : null;
+    if (!/^[A-Za-z0-9_-]+$/.test(value)) return null;
+    found = value;
   }
-  return null;
+  return found;
 }
 
 function browserCookieToken(token) {
@@ -532,19 +590,26 @@ function browserCookieToken(token) {
     .digest('base64url');
 }
 
-export function isRequestAuthorized(headers, token) {
+function browserCookieName(port) {
+  return `${ACCESS_COOKIE_PREFIX}${port}`;
+}
+
+export function isRequestAuthorized(headers, token, port = 4_477) {
   if (isAuthorized(headers?.authorization, token)) return true;
-  const cookieToken = cookieValue(headers?.cookie, ACCESS_COOKIE);
+  if (typeof token !== 'string') return false;
+  const cookieToken = cookieValue(headers?.cookie, browserCookieName(port));
   return cookieToken
     ? isAuthorized(`Bearer ${cookieToken}`, browserCookieToken(token))
     : false;
 }
 
-function isDocumentNavigation(req) {
+export function isDocumentNavigation(req) {
   const mode = req.headers['sec-fetch-mode'];
   const destination = req.headers['sec-fetch-dest'];
+  const site = req.headers['sec-fetch-site'];
   return req.method === 'GET'
     && !req.headers.origin
+    && (site == null || site === 'none' || site === 'same-origin')
     && (destination == null || destination === 'document')
     && (mode == null || mode === 'navigate' || destination == null);
 }
@@ -603,7 +668,6 @@ export function createDashboard({
   const fileCache = new Map();
   let snapshot = null;
   let pricingEntry = null;
-  let lastForcedRefreshAt = -Infinity;
 
   function loadPricing() {
     let stat;
@@ -644,7 +708,10 @@ export function createDashboard({
 
   function buildState() {
     const now = Date.now();
-    const cutoff = Number.isFinite(config.days) ? now - config.days * 86_400_000 : -Infinity;
+    const maximumActivity = now + FUTURE_TIMESTAMP_TOLERANCE_MS;
+    const cutoff = Number.isFinite(config.days)
+      ? calendarWindowStart(now, config.days).getTime()
+      : -Infinity;
     const sessions = [];
     const roots = new Set();
     const liveFiles = new Set();
@@ -668,6 +735,7 @@ export function createDashboard({
       eventsAccepted: 0,
       malformedLines: 0,
       invalidRows: 0,
+      rowErrors: 0,
       orphanResults: 0,
       invalidSessionIds: 0,
       sessionsOutsideWindow: 0,
@@ -771,6 +839,7 @@ export function createDashboard({
         if (fileDiagnostics?.tooLarge) diagnostics.filesTooLarge++;
         diagnostics.malformedLines += fileDiagnostics?.malformedLines ?? 0;
         diagnostics.invalidRows += fileDiagnostics?.invalidRows ?? 0;
+        diagnostics.rowErrors += fileDiagnostics?.rowErrors ?? 0;
         diagnostics.orphanResults += fileDiagnostics?.orphanResults ?? 0;
         diagnostics.invalidSessionIds += fileDiagnostics?.invalidSessionIds ?? 0;
         diagnostics.filesRejectedSymlink += fileDiagnostics?.symlinkRejected ? 1 : 0;
@@ -784,14 +853,16 @@ export function createDashboard({
             diagnostics.invalidSessionIds++;
             continue;
           }
-          const activity = latestSessionMs(session);
+          const hasFutureActivity = hasSessionActivityAfter(session, maximumActivity);
+          const activity = latestSessionMs(session, maximumActivity);
           if (activity == null) {
-            diagnostics.sessionsWithoutTimestamps++;
-            if (Number.isFinite(config.days)) continue;
-          } else if (activity > now + 5 * 60_000) {
+            if (hasFutureActivity) diagnostics.futureSessions++;
+            else diagnostics.sessionsWithoutTimestamps++;
+            if (hasFutureActivity || Number.isFinite(config.days)) continue;
+          } else if (hasFutureActivity) {
             diagnostics.futureSessions++;
-            continue;
-          } else if (activity < cutoff) {
+          }
+          if (activity != null && activity < cutoff) {
             diagnostics.sessionsOutsideWindow++;
             continue;
           }
@@ -848,6 +919,8 @@ export function createDashboard({
         }
       }
       for (const event of session.events) {
+        const eventTimestamp = parsedTimestamp(event.ts);
+        if (eventTimestamp != null && eventTimestamp > maximumActivity) continue;
         const targetId = event.kind === 'tool' ? event.tool.intrinsicSpawnTarget : null;
         if (typeof targetId !== 'string' || !targetId) continue;
         const target = byScopedId.get(`${session.source}\0${relationshipScope(session)}\0${targetId.toLowerCase()}`);
@@ -856,8 +929,14 @@ export function createDashboard({
     }
 
     for (const session of sessions) {
-      for (const { uuid, ev } of session.spawnCandidates) {
+      for (const { uuid, ev, ts } of session.spawnCandidates) {
         if (typeof uuid !== 'string') continue;
+        const eventTimestamp = parsedTimestamp(ev?.ts);
+        const candidateTimestamp = parsedTimestamp(ts);
+        if (
+          (eventTimestamp != null && eventTimestamp > maximumActivity)
+          || (candidateTimestamp != null && candidateTimestamp > maximumActivity)
+        ) continue;
         let candidates = byRawId.get(uuid.toLowerCase()) ?? [];
         const sameSource = candidates.filter((candidate) => candidate.source === session.source);
         if (sameSource.length) candidates = sameSource;
@@ -880,9 +959,16 @@ export function createDashboard({
 
     revisionParts.sort();
     const analysisByKey = new Map(
-      sessions.map((session) => [session.key, sessionIntelligence(session, pricing.value)]),
+      sessions.map((session) => [
+        session.key,
+        sessionIntelligence(session, pricing.value, {
+          now,
+          maximumTimestamp: maximumActivity,
+        }),
+      ]),
     );
     return {
+      scannedAt: now,
       roots: [...roots].sort(),
       sessions,
       byKey,
@@ -895,12 +981,16 @@ export function createDashboard({
 
   function getState(force = false, throttle = false) {
     const now = Date.now();
-    if (force && throttle && snapshot && now - lastForcedRefreshAt < limits.minRefreshMs) {
-      snapshot.state.diagnostics.refreshThrottled++;
-      return snapshot.state;
+    if (snapshot) {
+      const age = now - snapshot.createdAt;
+      if (force && throttle && age < limits.minRefreshMs) {
+        snapshot.state.diagnostics.refreshThrottled++;
+        return snapshot.state;
+      }
+      if (!force && age < Math.max(SNAPSHOT_TTL_MS, limits.minRefreshMs)) {
+        return snapshot.state;
+      }
     }
-    if (force && throttle) lastForcedRefreshAt = now;
-    if (!force && snapshot && now - snapshot.createdAt < SNAPSHOT_TTL_MS) return snapshot.state;
     const state = buildState();
     snapshot = { createdAt: now, state };
     return state;
@@ -919,11 +1009,15 @@ export function createDashboard({
   const server = http.createServer((req, res) => {
     const headOnly = req.method === 'HEAD';
     try {
-      if (!isAllowedHost(req.headers.host, config.port) || !isAllowedOrigin(req.headers.origin, config.port)) {
+      const address = server.address();
+      const listeningPort = address && typeof address === 'object'
+        ? address.port
+        : config.port;
+      if (!isAllowedHost(req.headers.host, listeningPort) || !isAllowedOrigin(req.headers.origin, listeningPort)) {
         return json(res, { error: 'forbidden host or origin' }, 403, headOnly);
       }
-      const url = new URL(req.url ?? '/', `http://127.0.0.1:${config.port}`);
-      if (url.pathname.startsWith('/api/') && !isRequestAuthorized(req.headers, apiToken)) {
+      const url = new URL(req.url ?? '/', `http://127.0.0.1:${listeningPort}`);
+      if (url.pathname.startsWith('/api/') && !isRequestAuthorized(req.headers, apiToken, listeningPort)) {
         res.setHeader('WWW-Authenticate', 'Bearer realm="runlume"');
         return json(res, { error: 'authentication required' }, 401, headOnly);
       }
@@ -945,32 +1039,33 @@ export function createDashboard({
 
       if (url.pathname === '/api/dashboard') {
         const state = filteredState(source, force);
-        const apiSessions = sessionsForApi(state.sessions);
+        const apiSessions = sessionsForApi(state.sessions, state.analysisByKey);
         return json(res, {
           roots: redactedRoots(state.roots),
           sources: adapters.map((adapter) => adapter.source),
           counts: state.counts,
           revision: state.revision,
           diagnostics: redactedDiagnostics(state.diagnostics),
-          generatedAt: new Date().toISOString(),
+          generatedAt: new Date(state.scannedAt).toISOString(),
           ...apiSessions,
           stats: redactedStats(buildStats(state.sessions, {
             days: config.days,
             pricing: state.pricing,
             analysisByKey: state.analysisByKey,
+            now: state.scannedAt,
           })),
         }, 200, headOnly);
       }
       if (url.pathname === '/api/state') {
         const state = filteredState(source, force);
-        const apiSessions = sessionsForApi(state.sessions);
+        const apiSessions = sessionsForApi(state.sessions, state.analysisByKey);
         return json(res, {
           roots: redactedRoots(state.roots),
           sources: adapters.map((adapter) => adapter.source),
           counts: state.counts,
           revision: state.revision,
           diagnostics: redactedDiagnostics(state.diagnostics),
-          generatedAt: new Date().toISOString(),
+          generatedAt: new Date(state.scannedAt).toISOString(),
           ...apiSessions,
         }, 200, headOnly);
       }
@@ -980,15 +1075,21 @@ export function createDashboard({
           days: config.days,
           pricing: state.pricing,
           analysisByKey: state.analysisByKey,
+          now: state.scannedAt,
         })), 200, headOnly);
       }
       if (url.pathname === '/api/session') {
         const state = getState(force, true);
+        const eligibleSessions = source && source !== 'all'
+          ? state.sessions.filter((candidate) => candidate.source === source)
+          : state.sessions;
         const key = url.searchParams.get('key');
-        let session = key ? state.byKey.get(key) : null;
+        let session = key
+          ? eligibleSessions.find((candidate) => candidate.key === key)
+          : null;
         if (!session) {
           const id = (url.searchParams.get('id') || '').toLowerCase();
-          const matches = state.sessions.filter((candidate) => candidate.id.toLowerCase() === id);
+          const matches = eligibleSessions.filter((candidate) => candidate.id.toLowerCase() === id);
           if (matches.length > 1) return json(res, { error: 'session id is ambiguous; use key' }, 409, headOnly);
           session = matches[0];
         }
@@ -1024,11 +1125,11 @@ export function createDashboard({
       ) {
         const body = fs.readFileSync(filePath);
         const headers = {
-          ...securityHeaders(MIME[path.extname(filePath)] ?? 'application/octet-stream', 'no-cache'),
+          ...securityHeaders(MIME[path.extname(filePath).toLowerCase()] ?? 'application/octet-stream', 'no-cache'),
           'Content-Length': body.length,
         };
-        if (relative === 'index.html' && isDocumentNavigation(req)) {
-          headers['Set-Cookie'] = `${ACCESS_COOKIE}=${browserCookieToken(apiToken)}; HttpOnly; SameSite=Strict; Path=/`;
+        if (relative.toLowerCase() === 'index.html' && isDocumentNavigation(req)) {
+          headers['Set-Cookie'] = `${browserCookieName(listeningPort)}=${browserCookieToken(apiToken)}; HttpOnly; SameSite=Strict; Path=/`;
         }
         res.writeHead(200, headers);
         return res.end(headOnly ? undefined : body);
@@ -1056,16 +1157,19 @@ export function start(config, logger = console) {
     process.exitCode = 1;
   });
   server.listen(config.port, '127.0.0.1', () => {
+    const address = server.address();
+    const listeningPort = address && typeof address === 'object' ? address.port : config.port;
     const started = Date.now();
     const state = dashboard.getState(true);
     const bySource = {};
     for (const session of state.sessions) bySource[session.source] = (bySource[session.source] || 0) + 1;
-    logger.log(`RunLume running at http://127.0.0.1:${config.port}/`);
+    logger.log(`RunLume running at http://127.0.0.1:${listeningPort}/`);
     logger.log(`sources: ${dashboard.adapters.map((adapter) => adapter.source).join(', ')} | window: ${Number.isFinite(config.days) ? `sessions active in the last ${config.days} days` : 'all history'}`);
     logger.log(`sessions: ${state.sessions.length} ${JSON.stringify(bySource)} (initial scan ${Date.now() - started}ms)`);
     if (!state.sessions.length) logger.log('No sessions found. Run "npm run sample" for demo data, or pass --all to scan all history.');
     const diagnosticIssues = state.diagnostics.malformedLines
       + state.diagnostics.invalidRows
+      + state.diagnostics.rowErrors
       + state.diagnostics.filesUnreadable
       + state.diagnostics.filesTooLarge
       + state.diagnostics.adapterErrors;

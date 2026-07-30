@@ -1,12 +1,24 @@
 {
   "currency": "USD",
-  "updatedAt": "2026-07-26",
+  "updatedAt": "2026-07-30",
   "unit": "per 1M tokens",
   "models": [
     {
       "id": "claude-fable-5",
       "label": "Claude Fable 5",
-      "models": ["claude-fable-5", "claude-mythos-5"],
+      "models": ["claude-fable-5"],
+      "allowDatedSuffix": true,
+      "input": 10,
+      "cacheWrite": 12.5,
+      "cacheWrite5m": 12.5,
+      "cacheWrite1h": 20,
+      "cacheRead": 1,
+      "output": 50
+    },
+    {
+      "id": "claude-mythos-5",
+      "label": "Claude Mythos 5",
+      "models": ["claude-mythos-5"],
       "allowDatedSuffix": true,
       "input": 10,
       "cacheWrite": 12.5,

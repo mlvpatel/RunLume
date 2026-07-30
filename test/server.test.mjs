@@ -4,21 +4,24 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   createDashboard,
   isAuthorized,
   isRequestAuthorized,
   isAllowedHost,
   isAllowedOrigin,
+  isDocumentNavigation,
   isRealPathWithin,
   latestSessionMs,
   parseConfig,
   redactedStats,
   sessionPageForApi,
+  start,
 } from '../server.mjs';
 import { buildStats } from '../analytics.mjs';
 
-const pricingFile = path.resolve(new URL('../pricing.json', import.meta.url).pathname);
+const pricingFile = fileURLToPath(new URL('../pricing.json', import.meta.url));
 const quietLogger = { log() {}, warn() {}, error() {} };
 
 function requestStatus(port, host) {
@@ -101,6 +104,31 @@ test('Bearer authentication uses the per-launch capability token', () => {
   assert.equal(isAuthorized(null, token), false);
   assert.equal(isRequestAuthorized({ cookie: `other=value; runlume_access=${token}` }, token), false);
   assert.equal(isRequestAuthorized({ cookie: 'runlume_access=invalid!' }, token), false);
+  assert.equal(isRequestAuthorized({}, null), false);
+});
+
+test('document bootstrap accepts only direct or same-origin navigation', () => {
+  const request = (headers = {}, method = 'GET') => ({ method, headers });
+  assert.equal(isDocumentNavigation(request()), true);
+  assert.equal(isDocumentNavigation(request({
+    'sec-fetch-site': 'none',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-dest': 'document',
+  })), true);
+  assert.equal(isDocumentNavigation(request({
+    'sec-fetch-site': 'same-origin',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-dest': 'document',
+  })), true);
+  for (const site of ['cross-site', 'same-site']) {
+    assert.equal(isDocumentNavigation(request({
+      'sec-fetch-site': site,
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-dest': 'document',
+    })), false);
+  }
+  assert.equal(isDocumentNavigation(request({ origin: 'http://localhost:4477' })), false);
+  assert.equal(isDocumentNavigation(request({}, 'HEAD')), false);
 });
 
 test('latest activity calculation remains stack safe for large sessions', () => {
@@ -112,6 +140,14 @@ test('latest activity calculation remains stack safe for large sessions', () => 
     endedAt: null,
     events,
   }), Date.parse('2026-07-21T00:00:00Z'));
+  assert.equal(latestSessionMs({
+    startedAt: '2026-07-19T00:00:00Z',
+    endedAt: '2100-01-01T00:00:00Z',
+    events: [
+      { ts: '2026-07-21T00:00:00Z' },
+      { ts: '2100-01-02T00:00:00Z' },
+    ],
+  }, Date.parse('2026-07-30T00:00:00Z')), Date.parse('2026-07-21T00:00:00Z'));
 });
 
 test('session API pages are complete and redact sensitive transcript content by default', () => {
@@ -228,6 +264,64 @@ test('aggregate API collections are capped with explicit omission counts', () =>
   assert.deepEqual(safe.outputLimits.tools, { total: 300, shown: 250, omitted: 50 });
 });
 
+test('aggregate redaction keeps shared file and directory labels consistent', () => {
+  const first = {
+    project: '/workspace/one',
+    path: 'src/a.js',
+    directory: 'src',
+  };
+  const second = {
+    project: '/workspace/two',
+    path: 'src/b.js',
+    directory: 'src',
+  };
+  const safe = redactedStats({
+    tools: [],
+    models: [],
+    providers: [],
+    impact: {
+      files: [first, second],
+      churnFiles: [first],
+      directories: [
+        { project: '/workspace/two', path: 'src' },
+        { project: '/workspace/one', path: 'src' },
+      ],
+    },
+    cost: { sessions: [] },
+    records: { longestSession: null },
+  });
+  assert.equal(safe.impact.files[0].path, 'File 1');
+  assert.equal(safe.impact.churnFiles[0].path, 'File 1');
+  assert.equal(safe.impact.files[0].directory, 'Directory 1');
+  assert.equal(safe.impact.files[1].directory, 'Directory 2');
+  assert.deepEqual(
+    safe.impact.directories.map((directory) => directory.path),
+    ['Directory 2', 'Directory 1'],
+  );
+});
+
+test('aggregate redaction caps nested model-rate collections', () => {
+  const rates = Array.from({ length: 300 }, (_, index) => ({
+    id: `rate-${index}`,
+    input: index,
+    output: index,
+  }));
+  const safe = redactedStats({
+    tools: [],
+    models: [{ name: 'mixed-model', rates }],
+    providers: [],
+    impact: { files: [], churnFiles: [], directories: [] },
+    cost: { sessions: [] },
+    records: { longestSession: null },
+  });
+  assert.equal(safe.models[0].rates.length, 250);
+  assert.deepEqual(safe.outputLimits.modelRates, {
+    total: 300,
+    shown: 250,
+    omitted: 50,
+  });
+});
+
 test('CLI configuration rejects ambiguous and invalid options', () => {
   assert.equal(parseConfig(['--all'], {}).days, Infinity);
   assert.equal(parseConfig(['--days', '7', '--sources', 'codex'], {}).days, 7);
@@ -242,9 +336,20 @@ test('CLI configuration rejects ambiguous and invalid options', () => {
   assert.throws(() => parseConfig(['--days', '3651'], {}), /expected 1-3650/);
   assert.throws(() => parseConfig(['--port', '99999'], {}), /invalid port/);
   assert.throws(() => parseConfig(['--sources', 'unknown'], {}), /unknown source/);
+  assert.throws(() => parseConfig(['--sources', ',,'], {}), /at least one source/);
   assert.throws(() => parseConfig(['--sources', 'api-log'], {}), /requires --import-dir/);
+  assert.throws(() => parseConfig(['--port', '3000', '--port', '4000'], {}), /only be provided once/);
+  assert.throws(() => parseConfig(['--all', '--all'], {}), /only be provided once/);
   assert.throws(() => parseConfig(['--dir', '.'], {}), /unknown option/);
   assert.throws(() => parseConfig(['--wat'], {}), /unknown option/);
+  const emptyEnvironment = parseConfig([], {
+    PORT: '',
+    RUNLUME_IMPORT_DIR: ' ',
+    RUNLUME_PRICING: '',
+  });
+  assert.equal(emptyEnvironment.port, 4477);
+  assert.equal(emptyEnvironment.importDir, null);
+  assert.equal(emptyEnvironment.pricingFile, pricingFile);
   const limited = parseConfig([], {
     RUNLUME_MAX_FILE_BYTES: '2048',
     RUNLUME_MAX_FILES: '12',
@@ -295,6 +400,197 @@ test('custom pricing files are regular, bounded files', (t) => {
     logger: quietLogger,
   }).getState(true);
   assert.match(state.diagnostics.pricingError, /exceeds 2097152 bytes/);
+});
+
+test('dashboard diagnostics aggregate adapter row errors without marking the file unreadable', (t) => {
+  const root = stateDir(t);
+  const id = '99999999-9999-4999-8999-999999999999';
+  writeSession(root, 'main', id, [
+    { type: 'session', id, timestamp: '2026-07-20T10:00:00Z' },
+    { type: 'message', timestamp: '2100-01-01T00:00:00Z', message: { role: 'assistant', content: [null] } },
+    { type: 'message', timestamp: '2026-07-20T10:00:02Z', message: { role: 'user', content: 'Later row' } },
+  ]);
+  const state = createDashboard({ config: config(root), logger: quietLogger }).getState(true);
+  assert.equal(state.sessions.length, 1);
+  assert.equal(state.sessions[0].label, 'Later row');
+  assert.equal(state.diagnostics.rowErrors, 1);
+  assert.equal(state.diagnostics.filesUnreadable, 0);
+});
+
+test('future transcript timestamps are excluded from selection and every API summary', async (t) => {
+  const root = stateDir(t);
+  const mixedId = '98989898-9898-4898-8989-989898989898';
+  const futureOnlyId = '97979797-9797-4979-8979-979797979797';
+  const now = Date.now;
+  Date.now = () => Date.parse('2026-07-30T12:00:00Z');
+  t.after(() => { Date.now = now; });
+
+  writeSession(root, 'main', mixedId, [
+    { type: 'session', id: mixedId, timestamp: '2026-07-20T10:00:00Z' },
+    { type: 'message', timestamp: '2026-07-20T10:00:01Z', message: { role: 'user', content: 'Current activity' } },
+    { type: 'message', timestamp: '2100-01-01T00:00:00Z', message: { role: 'assistant', content: 'Future clock' } },
+  ]);
+  writeSession(root, 'main', futureOnlyId, [
+    { type: 'session', id: futureOnlyId, timestamp: '2100-01-01T00:00:00Z' },
+    { type: 'message', timestamp: '2100-01-01T00:00:01Z', message: { role: 'user', content: 'Future only' } },
+  ]);
+
+  const dashboard = createDashboard({
+    config: config(root, { days: 30 }),
+    logger: quietLogger,
+  });
+  const state = dashboard.getState(true);
+  assert.deepEqual(state.sessions.map((session) => session.id), [mixedId]);
+  assert.equal(state.diagnostics.futureSessions, 2);
+  assert.equal(state.analysisByKey.get(state.sessions[0].key).futureEventsOmitted, 1);
+  assert.equal(state.analysisByKey.get(state.sessions[0].key).observed.messages, 1);
+
+  await new Promise((resolve, reject) => {
+    dashboard.server.once('error', reject);
+    dashboard.server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => dashboard.server.close());
+  const port = dashboard.server.address().port;
+  const headers = { Authorization: `Bearer ${dashboard.apiToken}` };
+  const response = await fetch(`http://127.0.0.1:${port}/api/dashboard`, { headers });
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(payload.sessions.length, 1);
+  assert.equal(payload.sessions[0].endedAt, '2026-07-20T10:00:01.000Z');
+  assert.equal(payload.sessions[0].stats.messages, 1);
+  assert.equal(payload.sessions[0].eventCount, 1);
+
+  const detailResponse = await fetch(
+    `http://127.0.0.1:${port}/api/session?key=${encodeURIComponent(payload.sessions[0].key)}`,
+    { headers },
+  );
+  assert.equal(detailResponse.status, 200);
+  const detail = await detailResponse.json();
+  assert.equal(detail.endedAt, '2026-07-20T10:00:01.000Z');
+  assert.equal(detail.stats.messages, 1);
+  assert.equal(detail.eventCount, 1);
+  assert.equal(detail.page.total, 1);
+  assert.equal(detail.events.length, 1);
+});
+
+test('future tool calls and results cannot create spawn relationships', (t) => {
+  const root = stateDir(t);
+  const parentId = '10101010-1010-4010-8010-101010101010';
+  const currentArgumentChild = '20202020-2020-4020-8020-202020202020';
+  const currentResultChild = '30303030-3030-4030-8030-303030303030';
+  const futureResultChild = '40404040-4040-4040-8040-404040404040';
+  const futureCallChild = '50505050-5050-4050-8050-505050505050';
+
+  writeSession(root, 'main', parentId, [
+    { type: 'session', id: parentId, timestamp: '2026-07-20T10:00:00Z' },
+    { type: 'message', timestamp: '2026-07-20T10:00:00Z', message: { role: 'user', content: 'Delegate safely' } },
+    {
+      type: 'message',
+      timestamp: '2026-07-20T10:00:01Z',
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'toolCall',
+          id: 'current-argument',
+          name: 'sessions_spawn',
+          arguments: { child: currentArgumentChild },
+        }],
+      },
+    },
+    {
+      type: 'message',
+      timestamp: '2026-07-20T10:00:02Z',
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'toolCall',
+          id: 'current-result',
+          name: 'sessions_spawn',
+          arguments: { task: 'current result' },
+        }],
+      },
+    },
+    {
+      type: 'message',
+      timestamp: '2026-07-20T10:00:03Z',
+      message: {
+        role: 'toolResult',
+        toolCallId: 'current-result',
+        content: `Spawned ${currentResultChild}`,
+      },
+    },
+    {
+      type: 'message',
+      timestamp: '2026-07-20T10:00:04Z',
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'toolCall',
+          id: 'future-result',
+          name: 'sessions_spawn',
+          arguments: { task: 'future result' },
+        }],
+      },
+    },
+    {
+      type: 'message',
+      timestamp: '2100-01-01T00:00:00Z',
+      message: {
+        role: 'toolResult',
+        toolCallId: 'future-result',
+        content: `Spawned ${futureResultChild}`,
+      },
+    },
+    {
+      type: 'message',
+      timestamp: '2100-01-01T00:00:01Z',
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'toolCall',
+          id: 'future-call',
+          name: 'sessions_spawn',
+          arguments: { child: futureCallChild },
+        }],
+      },
+    },
+  ]);
+  for (const childId of [
+    currentArgumentChild,
+    currentResultChild,
+    futureResultChild,
+    futureCallChild,
+  ]) {
+    writeSession(root, 'main', childId, genericRows(childId));
+  }
+
+  const originalNow = Date.now;
+  Date.now = () => Date.parse('2026-07-30T12:00:00Z');
+  t.after(() => { Date.now = originalNow; });
+  const state = createDashboard({
+    config: config(root, { days: 30 }),
+    logger: quietLogger,
+  }).getState(true);
+  const parent = state.sessions.find((session) => session.id === parentId);
+  const childrenById = new Map(state.sessions.map((session) => [session.id, session]));
+  assert.deepEqual(
+    new Set(parent.children),
+    new Set([
+      childrenById.get(currentArgumentChild).key,
+      childrenById.get(currentResultChild).key,
+    ]),
+  );
+  assert.equal(childrenById.get(futureResultChild).parent, null);
+  assert.equal(childrenById.get(futureCallChild).parent, null);
+  assert.equal(
+    buildStats(state.sessions, {
+      days: 30,
+      pricing: state.pricing,
+      analysisByKey: state.analysisByKey,
+      now: state.scannedAt,
+    }).totals.spawns,
+    2,
+  );
 });
 
 test('scan budgets cap files, sessions, bytes, and events with diagnostics', (t) => {
@@ -445,10 +741,91 @@ test('cache invalidates same-size replacements even when modification time is re
   assert.notEqual(fs.statSync(file).ino, originalStat.ino);
 });
 
+test('refresh throttling is based on the last scan and zero disables forced throttling', (t) => {
+  const root = stateDir(t);
+  const id = '88888888-8888-4888-8888-888888888888';
+  const file = writeSession(root, 'main', id, genericRows(id));
+  const originalNow = Date.now;
+  let clock = originalNow();
+  Date.now = () => clock;
+  t.after(() => { Date.now = originalNow; });
+
+  const dashboard = createDashboard({
+    config: config(root, { limits: { minRefreshMs: 60_000 } }),
+    logger: quietLogger,
+  });
+  const first = dashboard.getState(true, true);
+  assert.equal(first.sessions[0].label, 'Hello');
+
+  fs.writeFileSync(file, `${genericRows(id).map((row) => JSON.stringify(
+    row.type === 'message' && row.message?.role === 'user'
+      ? { ...row, message: { ...row.message, content: 'Changed' } }
+      : row,
+  )).join('\n')}\n`);
+  const future = new Date(originalNow() + 5_000);
+  fs.utimesSync(file, future, future);
+  clock += 2_000;
+  assert.equal(dashboard.getState(false, true).sessions[0].label, 'Hello');
+  assert.equal(dashboard.getState(true, true).sessions[0].label, 'Hello');
+  assert.equal(first.diagnostics.refreshThrottled, 1);
+  clock += 60_000;
+  assert.equal(dashboard.getState(false, true).sessions[0].label, 'Changed');
+
+  const unthrottled = createDashboard({
+    config: config(root, { limits: { minRefreshMs: 0 } }),
+    logger: quietLogger,
+  });
+  assert.equal(unthrottled.getState(true, true).sessions[0].label, 'Changed');
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('Changed', 'Updated'));
+  fs.utimesSync(file, new Date(future.getTime() + 5_000), new Date(future.getTime() + 5_000));
+  assert.equal(unthrottled.getState(true, true).sessions[0].label, 'Updated');
+});
+
+test('start binds the production server only to IPv4 loopback', async (t) => {
+  const root = stateDir(t);
+  const dashboard = start(config(root, { port: 0 }), quietLogger);
+  t.after(() => dashboard.server.close());
+  await new Promise((resolve, reject) => {
+    if (dashboard.server.listening) return resolve();
+    dashboard.server.once('listening', resolve);
+    dashboard.server.once('error', reject);
+  });
+  const address = dashboard.server.address();
+  assert.equal(address.address, '127.0.0.1');
+  assert.ok(address.port > 0);
+});
+
+test('request validation uses the actual bound port for exported dashboards', async (t) => {
+  const root = stateDir(t);
+  const dashboard = createDashboard({
+    config: config(root, { port: 4477 }),
+    logger: quietLogger,
+  });
+  await new Promise((resolve, reject) => {
+    dashboard.server.once('error', reject);
+    dashboard.server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => dashboard.server.close());
+  const port = dashboard.server.address().port;
+
+  const unauthenticated = await fetch(`http://127.0.0.1:${port}/api/dashboard`);
+  assert.equal(unauthenticated.status, 401);
+  const authenticated = await fetch(`http://127.0.0.1:${port}/api/dashboard`, {
+    headers: { Authorization: `Bearer ${dashboard.apiToken}` },
+  });
+  assert.equal(authenticated.status, 200);
+});
+
 test('HTTP API emits security headers and rejects mutations', async (t) => {
   const root = stateDir(t);
   const id = '55555555-5555-4555-8555-555555555555';
-  writeSession(root, 'main', id, genericRows(id));
+  const sentinel = '/private/runlume-sentinel/prompt-secret';
+  writeSession(root, 'main', id, [
+    { type: 'session', id, timestamp: '2026-07-20T10:00:00Z', cwd: sentinel },
+    { type: 'message', timestamp: '2026-07-20T10:00:00Z', message: { role: 'assistant', content: [null] } },
+    { type: 'message', timestamp: '2026-07-20T10:00:00Z', message: { role: 'user', content: sentinel } },
+    { type: 'message', timestamp: '2026-07-20T10:00:01Z', message: { role: 'assistant', model: 'claude-opus-4-8', content: 'Done' } },
+  ]);
   const dashboard = createDashboard({
     config: config(root, { port: 0, limits: { minRefreshMs: 60_000 } }),
     logger: quietLogger,
@@ -471,16 +848,51 @@ test('HTTP API emits security headers and rejects mutations', async (t) => {
   assert.equal(response.status, 401);
   assert.match(response.headers.get('www-authenticate'), /^Bearer /);
 
+  const crossSiteHeaders = await new Promise((resolve, reject) => {
+    const request = http.request({
+      hostname: '127.0.0.1',
+      port,
+      path: '/',
+      headers: {
+        Host: `127.0.0.1:${port}`,
+        'Sec-Fetch-Site': 'cross-site',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Dest': 'document',
+      },
+    }, (crossSiteResponse) => {
+      crossSiteResponse.resume();
+      crossSiteResponse.on('end', () => resolve(crossSiteResponse.headers));
+    });
+    request.on('error', reject);
+    request.end();
+  });
+  assert.equal(crossSiteHeaders['set-cookie'], undefined);
+
   const bootstrap = await fetch(`http://127.0.0.1:${port}/`);
   assert.equal(bootstrap.status, 200);
   const setCookie = bootstrap.headers.get('set-cookie');
-  assert.match(setCookie, /^runlume_access=[A-Za-z0-9_-]+; HttpOnly; SameSite=Strict; Path=\/$/);
+  assert.match(setCookie, new RegExp(`^runlume_access_${port}=[A-Za-z0-9_-]+; HttpOnly; SameSite=Strict; Path=/$`));
   assert.equal(setCookie.includes(dashboard.apiToken), false);
   const cookie = setCookie.split(';', 1)[0];
   const cookieAuthenticated = await fetch(`http://127.0.0.1:${port}/api/dashboard`, {
     headers: { Cookie: cookie },
   });
   assert.equal(cookieAuthenticated.status, 200);
+  const [cookieName] = cookie.split('=', 1);
+  const staleCookieName = `runlume_access_${port + 1}`;
+  assert.equal(cookieName, `runlume_access_${port}`);
+  const staleCookie = await fetch(`http://127.0.0.1:${port}/api/dashboard`, {
+    headers: { Cookie: `${staleCookieName}=invalid` },
+  });
+  assert.equal(staleCookie.status, 401);
+  const staleAndCurrentCookie = await fetch(`http://127.0.0.1:${port}/api/dashboard`, {
+    headers: { Cookie: `${staleCookieName}=invalid; ${cookie}` },
+  });
+  assert.equal(staleAndCurrentCookie.status, 200);
+  const duplicateCookie = await fetch(`http://127.0.0.1:${port}/api/dashboard`, {
+    headers: { Cookie: `${cookie}; ${cookie}` },
+  });
+  assert.equal(duplicateCookie.status, 401);
 
   const headers = { Authorization: `Bearer ${dashboard.apiToken}` };
   const authenticated = await fetch(`http://127.0.0.1:${port}/api/dashboard`, { headers });
@@ -497,20 +909,91 @@ test('HTTP API emits security headers and rejects mutations', async (t) => {
   assert.equal(payload.sessions[0].events, undefined);
   assert.equal(payload.sessions[0].intelligence, undefined);
   assert.match(payload.sessions[0].label, /^Session /);
+  assert.equal(payload.diagnostics.rowErrors, 1);
+  assert.equal(JSON.stringify(payload).includes(sentinel), false);
+
+  for (const endpoint of ['/api/state', '/api/stats']) {
+    const protectedResponse = await fetch(`http://127.0.0.1:${port}${endpoint}`, { headers });
+    assert.equal(protectedResponse.status, 200);
+    assert.equal((await protectedResponse.text()).includes(sentinel), false);
+  }
+  const sessionResponse = await fetch(
+    `http://127.0.0.1:${port}/api/session?key=${encodeURIComponent(payload.sessions[0].key)}`,
+    { headers },
+  );
+  assert.equal(sessionResponse.status, 200);
+  assert.equal((await sessionResponse.text()).includes(sentinel), false);
 
   const invalidSource = await fetch(`http://127.0.0.1:${port}/api/dashboard?source=disabled`, { headers });
   assert.equal(invalidSource.status, 400);
 
   const forced = await fetch(`http://127.0.0.1:${port}/api/dashboard?refresh=1`, { headers });
   assert.equal(forced.status, 200);
+  assert.equal((await forced.json()).diagnostics.refreshThrottled, 1);
   const throttled = await fetch(`http://127.0.0.1:${port}/api/dashboard?refresh=1`, { headers });
   assert.equal(throttled.status, 200);
-  assert.equal((await throttled.json()).diagnostics.refreshThrottled, 1);
+  assert.equal((await throttled.json()).diagnostics.refreshThrottled, 2);
 
   const post = await fetch(`http://127.0.0.1:${port}/api/dashboard`, { method: 'POST', headers });
   assert.equal(post.status, 405);
   const malformedPath = await fetch(`http://127.0.0.1:${port}/%E0%A4%A`);
   assert.equal(malformedPath.status, 400);
+  for (const unsafePath of [
+    '/../server.mjs',
+    '/%2e%2e%2fserver.mjs',
+    '/%00',
+    '/..\\server.mjs',
+    '/../public-evil/index.html',
+  ]) {
+    const traversal = await fetch(`http://127.0.0.1:${port}${unsafePath}`);
+    assert.equal(traversal.status, 404);
+  }
   assert.equal(await requestStatus(port, `example.com:${port}`), 403);
   assert.equal(await requestStatus(port, 'bad_host'), 403);
+});
+
+test('session API applies the requested source before key lookup', async (t) => {
+  const root = stateDir(t);
+  const hermesId = '77777777-7777-4777-8777-777777777777';
+  writeSession(root, 'main', hermesId, genericRows(hermesId));
+  fs.writeFileSync(path.join(root, 'api-log.jsonl'), `${JSON.stringify({
+    provider: 'openai',
+    session_id: 'api-session',
+    timestamp: '2026-07-20T10:00:00Z',
+    request: { model: 'gpt-5.3-codex', input: 'Imported' },
+    response: { model: 'gpt-5.3-codex', output_text: 'Done' },
+  })}\n`);
+
+  const dashboard = createDashboard({
+    config: config(root, {
+      port: 0,
+      importDir: root,
+      sources: ['hermes', 'api-log'],
+      limits: { minRefreshMs: 0 },
+    }),
+    logger: quietLogger,
+  });
+  await new Promise((resolve, reject) => {
+    dashboard.server.once('error', reject);
+    dashboard.server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => dashboard.server.close());
+  const port = dashboard.server.address().port;
+  const headers = { Authorization: `Bearer ${dashboard.apiToken}` };
+  const stateResponse = await fetch(`http://127.0.0.1:${port}/api/state`, { headers });
+  assert.equal(stateResponse.status, 200);
+  const state = await stateResponse.json();
+  const imported = state.sessions.find((session) => session.source === 'api-log');
+  assert.ok(imported);
+
+  const mismatched = await fetch(
+    `http://127.0.0.1:${port}/api/session?source=hermes&key=${encodeURIComponent(imported.key)}`,
+    { headers },
+  );
+  assert.equal(mismatched.status, 404);
+  const matched = await fetch(
+    `http://127.0.0.1:${port}/api/session?source=api-log&key=${encodeURIComponent(imported.key)}`,
+    { headers },
+  );
+  assert.equal(matched.status, 200);
 });

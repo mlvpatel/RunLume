@@ -1,9 +1,10 @@
 # Architecture
 
-RunLume is a read-only local analysis pipeline. Its security boundary is the
-single user's machine and the loopback interface.
+RunLume is a read-only local analysis pipeline for one trusted user. Its network
+boundary is the loopback interface; it is not an access-control boundary
+between processes or accounts on the same machine.
 
-![RunLume data flow and trust boundary](./architecture.svg)
+![RunLume data flow and trust boundary](https://raw.githubusercontent.com/mlvpatel/RunLume/main/docs/architecture.svg)
 
 ## Data flow
 
@@ -31,7 +32,8 @@ session
     └── tool call + result + outcome + duration
 ```
 
-Malformed records are skipped and counted. IDs, model and tool names, counters,
+Malformed records and records that fail adapter normalization are skipped and
+counted without truncating later records. IDs, model and tool names, counters,
 timestamps, analytics paths, files, events, and sessions are bounded before
 analysis.
 
@@ -52,12 +54,14 @@ never runs transcript commands or patches.
 ### 4. API boundary
 
 `server.mjs` creates one random capability per launch and binds to `127.0.0.1`.
-A direct document navigation receives a browser-specific capability in an
+A direct document navigation receives a per-launch browser-session capability in an
 `HttpOnly`, `SameSite=Strict` session cookie. It is derived from the raw API
 token with HMAC, so the raw token is never stored in the cookie, read by
-JavaScript, or logged. Every `/api/` request requires that cookie or an explicit
-Bearer token. Host and Origin validation rejects non-loopback names, user-info
-tricks, malformed hosts, wrong ports, and non-HTTP origins.
+JavaScript, or logged. The cookie name includes the listening port, which keeps
+parallel loopback services separate and lets a restart overwrite the prior
+value. Every `/api/` request requires that cookie or an explicit Bearer token.
+Host and Origin validation rejects non-loopback names, user-info tricks,
+malformed hosts, wrong ports, and non-HTTP origins.
 
 Dashboard responses contain hashed public session keys, generic labels, and
 redacted content. Raw trajectory data is returned only after an authenticated,
@@ -80,9 +84,9 @@ redacted trajectory pagination.
 ## Cache and refresh logic
 
 Parsed files are cached by device, inode, size, modification time, and change
-time. A changed fingerprint causes a reparse. Dashboard snapshots have a short
-in-memory lifetime, hidden tabs stop polling, and forced refreshes are
-rate-limited.
+time. A changed fingerprint causes a reparse. Dashboard snapshots observe the
+configured minimum rescan interval for polling and forced refreshes, and hidden
+tabs stop polling.
 
 The cache stores data only in process memory. RunLume creates no transcript
 database and writes nothing into agent state directories.
@@ -93,7 +97,7 @@ database and writes nothing into agent state directories.
 |---|---|---|
 | Agent state | Read-only access, symlink rejection, root containment | Correctness or completeness of vendor transcript formats |
 | Import directory | Explicit opt-in, same file and path bounds | Safety of data the user chose to capture |
-| Local API | Loopback bind, Host/Origin checks, launch token | Multi-user access control or safe network exposure |
+| Local API | Loopback bind, Host/Origin checks, per-launch browser capability | Multi-user access control or safe network exposure |
 | Browser | Default redaction, bounded payloads, restrictive headers | Safety after the user reveals and copies raw content |
 | Pricing | Dated, validated local table and visible unknowns | Invoice accuracy, discounts, regional or special tool charges |
 

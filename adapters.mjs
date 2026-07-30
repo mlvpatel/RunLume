@@ -66,6 +66,15 @@ function boundedIdentifier(value, maxLength, fallback = null) {
   return normalized ? normalized.slice(0, maxLength) : fallback;
 }
 
+function normalizedTimestamp(value) {
+  if (typeof value !== 'string' || !value || value.length > 128) return null;
+  return Number.isFinite(Date.parse(value)) ? value : null;
+}
+
+function firstText(...values) {
+  return values.find((value) => typeof value === 'string') ?? '';
+}
+
 function assignSessionModel(session, value) {
   const model = boundedIdentifier(value, MAX_MODEL_NAME_LENGTH);
   if (model) session.model = model;
@@ -100,14 +109,24 @@ export function newSession(source, file, agent) {
 
 function blocksOf(content) {
   if (content == null) return [];
-  if (typeof content === 'string') return [{ type: 'text', text: content }];
-  if (Array.isArray(content)) return content;
-  return [content];
+  const values = Array.isArray(content) ? content : [content];
+  return values.map((block) => {
+    if (typeof block === 'string') return { type: 'text', text: block };
+    if (!block || typeof block !== 'object' || Array.isArray(block)) {
+      throw new TypeError('message content contains an invalid block');
+    }
+    for (const field of ['text', 'thinking']) {
+      if (block[field] != null && typeof block[field] !== 'string') {
+        throw new TypeError(`message block ${field} must be a string`);
+      }
+    }
+    return block;
+  });
 }
 
 function textOf(content) {
   return blocksOf(content)
-    .map((b) => (typeof b === 'string' ? b : b.text ?? b.thinking ?? ''))
+    .map((block) => firstText(block.text, block.thinking))
     .filter(Boolean)
     .join('\n');
 }
@@ -184,6 +203,7 @@ function readDiagnostics(file, streamed) {
     parsedLines: 0,
     malformedLines: 0,
     invalidRows: 0,
+    rowErrors: 0,
     orphanResults: 0,
     invalidSessionIds: 0,
     readError: null,
@@ -253,8 +273,15 @@ export function readJsonLines(file, maxBytes = maxTranscriptBytes(), onRow = nul
       diagnostics.invalidRows++;
       return;
     }
-    if (onRow) onRow(row, diagnostics);
-    else out.push(row);
+    if (onRow) {
+      try {
+        onRow(row, diagnostics);
+      } catch {
+        diagnostics.rowErrors++;
+      }
+    } else {
+      out.push(row);
+    }
   };
   try {
     for (;;) {
@@ -303,8 +330,15 @@ export function readJsonDocument(file, maxBytes = maxTranscriptBytes(), onRow = 
       diagnostics.invalidRows++;
       return;
     }
-    if (onRow) onRow(row, diagnostics);
-    else out.push(row);
+    if (onRow) {
+      try {
+        onRow(row, diagnostics);
+      } catch {
+        diagnostics.rowErrors++;
+      }
+    } else {
+      out.push(row);
+    }
   };
   diagnostics.lines = 1;
   let document;
@@ -314,36 +348,74 @@ export function readJsonDocument(file, maxBytes = maxTranscriptBytes(), onRow = 
     diagnostics.malformedLines = 1;
     return { rows: out, diagnostics };
   }
-  try {
-    for (const row of Array.isArray(document) ? document : [document]) accept(row);
-  } catch (err) {
-    diagnostics.readError = err instanceof Error ? err.message : String(err);
-  }
+  for (const row of Array.isArray(document) ? document : [document]) accept(row);
   return { rows: out, diagnostics };
+}
+
+function nestedUuids(value) {
+  const found = new Set();
+  const seen = new WeakSet();
+  const stack = [{ value, depth: 0 }];
+  let visited = 0;
+  while (stack.length && visited < 10_000) {
+    const current = stack.pop();
+    visited++;
+    if (typeof current.value === 'string') {
+      for (const uuid of current.value.match(UUID_RE) ?? []) found.add(uuid.toLowerCase());
+      continue;
+    }
+    if (
+      !current.value
+      || typeof current.value !== 'object'
+      || current.depth >= 64
+      || seen.has(current.value)
+    ) continue;
+    seen.add(current.value);
+    const values = Array.isArray(current.value)
+      ? current.value
+      : Object.values(current.value);
+    for (let index = Math.min(values.length, 1_000) - 1; index >= 0; index--) {
+      stack.push({ value: values[index], depth: current.depth + 1 });
+    }
+  }
+  return [...found];
 }
 
 function addToolCall(session, pending, ts, { id, name, args }) {
   const toolName = boundedIdentifier(name, MAX_TOOL_NAME_LENGTH, 'tool');
-  const ev = { kind: 'tool', ts, tool: { id: id ?? null, name: toolName, args: args ?? {}, result: null, isError: false, resultTs: null } };
+  const safeArgs = args ?? {};
+  const spawnUuids = SPAWN_TOOL_RE.test(toolName) ? nestedUuids(safeArgs) : [];
+  const eventTs = normalizedTimestamp(ts);
+  const ev = {
+    kind: 'tool',
+    ts: eventTs,
+    tool: {
+      id: id ?? null,
+      name: toolName,
+      args: safeArgs,
+      result: null,
+      isError: false,
+      resultTs: null,
+    },
+  };
   session.stats.toolCounts[toolName] = tokenSum(session.stats.toolCounts[toolName], 1);
   session.events.push(ev);
   if (id) pending.set(id, ev);
-  if (SPAWN_TOOL_RE.test(toolName)) {
-    for (const u of JSON.stringify(args ?? {}).match(UUID_RE) ?? []) session.spawnCandidates.push({ uuid: u.toLowerCase(), ev });
-  }
+  for (const uuid of spawnUuids) session.spawnCandidates.push({ uuid, ev, ts: eventTs });
   return ev;
 }
 
 function attachResult(session, pending, callId, text, isError, ts, diagnostics = null, fallbackEvent = null) {
   const ev = (callId && pending.get(callId)) || fallbackEvent;
   if (ev) {
-    ev.tool.result = text;
+    const safeText = typeof text === 'string' ? text : '';
+    const spawnUuids = SPAWN_TOOL_RE.test(ev.tool.name) ? nestedUuids(safeText) : [];
+    const resultTs = normalizedTimestamp(ts);
+    ev.tool.result = safeText;
     ev.tool.isError = Boolean(isError);
-    ev.tool.resultTs = ts;
+    ev.tool.resultTs = resultTs;
     if (callId) pending.delete(callId);
-    if (SPAWN_TOOL_RE.test(ev.tool.name)) {
-      for (const u of (text ?? '').match(UUID_RE) ?? []) session.spawnCandidates.push({ uuid: u.toLowerCase(), ev });
-    }
+    for (const uuid of spawnUuids) session.spawnCandidates.push({ uuid, ev, ts: resultTs });
     if (isError) session.stats.errors++;
   } else if (callId && diagnostics) {
     diagnostics.orphanResults++;
@@ -351,17 +423,18 @@ function attachResult(session, pending, callId, text, isError, ts, diagnostics =
 }
 
 function touch(session, ts) {
-  if (!ts) return;
-  const ms = Date.parse(ts);
-  if (!Number.isFinite(ms)) return;
-  if (!session.startedAt || ms < Date.parse(session.startedAt)) session.startedAt = ts;
-  if (!session.endedAt || ms > Date.parse(session.endedAt)) session.endedAt = ts;
+  const normalized = normalizedTimestamp(ts);
+  if (!normalized) return null;
+  const ms = Date.parse(normalized);
+  if (!session.startedAt || ms < Date.parse(session.startedAt)) session.startedAt = normalized;
+  if (!session.endedAt || ms > Date.parse(session.endedAt)) session.endedAt = normalized;
+  return normalized;
 }
 
 function finalizeLabel(session) {
   if (!session.label) {
     const first = session.events.find((e) => e.kind === 'user' || e.kind === 'assistant');
-    session.label = first ? first.text.slice(0, 100) : '(empty session)';
+    session.label = typeof first?.text === 'string' ? first.text.slice(0, 100) : '(empty session)';
   }
 }
 
@@ -426,39 +499,76 @@ function fileModifiedTimestamp(file) {
 
 // ── Generic message parser used by Hermes ───────────────────────────────────
 function parseGenericMessage(session, pending, obj, diagnostics = null) {
-  const m = obj.message ?? (obj.role ? obj : null);
+  const hasMessageEnvelope = Object.hasOwn(obj, 'message');
+  if (
+    hasMessageEnvelope
+    && (!obj.message || typeof obj.message !== 'object' || Array.isArray(obj.message))
+  ) {
+    throw new TypeError('message envelope must be an object');
+  }
+  const m = hasMessageEnvelope ? obj.message : (obj.role ? obj : null);
   if (!m) {
-    if (obj.type && obj.type !== 'session') session.events.push({ kind: 'meta', ts: obj.timestamp ?? null, text: obj.type });
+    if (typeof obj.type === 'string' && obj.type !== 'session') {
+      session.events.push({ kind: 'meta', ts: normalizedTimestamp(obj.timestamp), text: obj.type });
+    }
     return;
   }
-  const ts = obj.timestamp ?? m.timestamp ?? null;
-  touch(session, ts);
+  const ts = normalizedTimestamp(obj.timestamp ?? m.timestamp);
   const role = m.role;
+  if (!['assistant', 'system', 'toolResult', 'tool', 'user'].includes(role)) {
+    throw new TypeError('message envelope has an unsupported role');
+  }
+  const blocks = role === 'assistant' || role === 'system' || role === 'user'
+    ? blocksOf(m.content)
+    : null;
+  const directResult = role === 'toolResult' || role === 'tool'
+    ? textOf(m.content ?? m.output ?? m.result ?? '')
+    : null;
+  const userResults = role === 'user'
+    ? blocks
+      .filter((block) => block.type === 'tool_result' || block.type === 'toolResult')
+      .map((block) => ({
+        id: block.tool_use_id ?? block.toolCallId,
+        text: textOf(block.content ?? ''),
+        isError: block.is_error ?? block.isError,
+      }))
+    : [];
+  const userText = role === 'user'
+    ? blocks
+      .filter((block) => (block.type ?? 'text') === 'text')
+      .map((block) => firstText(block.text))
+      .filter(Boolean)
+      .join('\n')
+    : '';
+  touch(session, ts);
 
   if (role === 'assistant') {
     session.stats.messages++;
     const messageModel = assignSessionModel(session, m.model);
     recordUsage(session, m.usage, ts, messageModel ?? session.model);
-    for (const b of blocksOf(m.content)) {
+    for (const b of blocks) {
       const t = b.type ?? 'text';
-      if (t === 'thinking' || t === 'redacted_thinking') session.events.push({ kind: 'thinking', ts, text: b.thinking ?? b.text ?? '' });
-      else if (t === 'text') { if (b.text) session.events.push({ kind: 'assistant', ts, text: b.text }); }
+      if (t === 'thinking' || t === 'redacted_thinking') {
+        const text = firstText(b.thinking, b.text);
+        if (text) session.events.push({ kind: 'thinking', ts, text });
+      } else if (t === 'text' && typeof b.text === 'string' && b.text) {
+        session.events.push({ kind: 'assistant', ts, text: b.text });
+      }
       else if (t === 'toolCall' || t === 'tool_use' || t === 'toolUse')
         addToolCall(session, pending, ts, { id: b.id ?? b.toolCallId, name: b.name ?? b.toolName ?? 'tool', args: b.arguments ?? b.input });
     }
   } else if (role === 'toolResult' || role === 'tool') {
-    attachResult(session, pending, m.toolCallId ?? m.tool_call_id ?? m.id, textOf(m.content ?? m.output ?? m.result ?? ''), m.isError ?? m.is_error, ts, diagnostics);
+    attachResult(session, pending, m.toolCallId ?? m.tool_call_id ?? m.id, directResult, m.isError ?? m.is_error, ts, diagnostics);
   } else if (role === 'user') {
-    const blocks = blocksOf(m.content);
-    const results = blocks.filter((b) => b.type === 'tool_result' || b.type === 'toolResult');
-    if (results.length) {
-      for (const b of results) attachResult(session, pending, b.tool_use_id ?? b.toolCallId, textOf(b.content ?? ''), b.is_error ?? b.isError, ts, diagnostics);
+    if (userResults.length) {
+      for (const result of userResults) {
+        attachResult(session, pending, result.id, result.text, result.isError, ts, diagnostics);
+      }
     }
-    const text = blocks.filter((b) => (b.type ?? 'text') === 'text').map((b) => b.text ?? '').filter(Boolean).join('\n');
-    if (text && !isInjectedMetadataText(text)) {
+    if (userText && !isInjectedMetadataText(userText)) {
       session.stats.messages++;
-      session.events.push({ kind: 'user', ts, text });
-      if (!session.label) session.label = text.slice(0, 100);
+      session.events.push({ kind: 'user', ts, text: userText });
+      if (!session.label) session.label = userText.slice(0, 100);
     }
   }
 }
@@ -469,7 +579,7 @@ export function parseGenericAgentFile(source, file, agent, maxBytes = maxTranscr
   const { diagnostics } = readJsonLines(file, maxBytes, (obj, rowDiagnostics) => {
     if (obj.type === 'session') {
       if (Object.hasOwn(obj, 'id')) assignSessionId(session, obj.id, rowDiagnostics);
-      if (obj.cwd) session.cwd = obj.cwd;
+      if (typeof obj.cwd === 'string' && obj.cwd) session.cwd = obj.cwd;
       touch(session, obj.timestamp);
       return;
     }
@@ -490,15 +600,16 @@ const CC_SKIP_TYPES = new Set([
 ]);
 
 function ccParseMessageInto(session, pending, obj, diagnostics) {
-  const ts = obj.timestamp ?? null;
-  touch(session, ts);
-  if (obj.cwd) session.cwd ??= obj.cwd;
+  const ts = normalizedTimestamp(obj.timestamp);
   if (obj.type === 'system') {
+    touch(session, ts);
+    if (typeof obj.cwd === 'string' && obj.cwd) session.cwd ??= obj.cwd;
     if (!obj.isMeta) session.events.push({ kind: 'meta', ts, text: obj.subtype ?? 'system' });
     return;
   }
   if (obj.isMeta) return;
   parseGenericMessage(session, pending, obj, diagnostics);
+  if (typeof obj.cwd === 'string' && obj.cwd) session.cwd ??= obj.cwd;
 }
 
 export function parseClaudeCodeFile(file, projectDir, maxBytes = maxTranscriptBytes()) {
@@ -508,16 +619,19 @@ export function parseClaudeCodeFile(file, projectDir, maxBytes = maxTranscriptBy
   const sidechainLines = [];
 
   const { diagnostics } = readJsonLines(file, maxBytes, (obj, rowDiagnostics) => {
-    if (obj.cwd) {
-      main.cwd ??= obj.cwd;
-      if (main.agent === projectDir) main.agent = path.basename(obj.cwd);
+    if (obj.type === 'ai-title' && typeof obj.aiTitle === 'string' && obj.aiTitle) {
+      title = obj.aiTitle;
+      return;
     }
-    if (obj.type === 'ai-title' && obj.aiTitle) { title = obj.aiTitle; return; }
-    if (obj.type === 'summary' && obj.summary) { title ??= obj.summary; return; }
+    if (obj.type === 'summary' && typeof obj.summary === 'string' && obj.summary) {
+      title ??= obj.summary;
+      return;
+    }
     if (CC_SKIP_TYPES.has(obj.type)) return;
     if (obj.isSidechain) { sidechainLines.push(obj); return; }
     if (obj.type === 'user' || obj.type === 'assistant' || obj.type === 'system') {
       ccParseMessageInto(main, pendingMain, obj, rowDiagnostics);
+      if (main.cwd && main.agent === projectDir) main.agent = path.basename(main.cwd);
     }
   });
   if (title) main.label = title;
@@ -525,10 +639,45 @@ export function parseClaudeCodeFile(file, projectDir, maxBytes = maxTranscriptBy
 
   // Sidechains = Task sub-agent transcripts stored in the same file. Group the
   // sidechain entries into chains by walking parentUuid to each chain's root.
-  const byUuid = new Map(sidechainLines.filter((o) => o.uuid).map((o) => [o.uuid, o]));
-  const rootOf = (o, seen = new Set()) => {
-    while (o.parentUuid && byUuid.has(o.parentUuid) && !seen.has(o.uuid)) { seen.add(o.uuid); o = byUuid.get(o.parentUuid); }
-    return o.uuid ?? `unidentified-${sidechainLines.indexOf(o)}`;
+  const byUuid = new Map(
+    sidechainLines
+      .filter((entry) => typeof entry.uuid === 'string' && entry.uuid)
+      .map((entry) => [entry.uuid, entry]),
+  );
+  const sidechainIndexes = new Map(sidechainLines.map((entry, index) => [entry, index]));
+  const rootCache = new Map();
+  const rootOf = (entry) => {
+    const trail = [];
+    const positions = new Map();
+    let current = entry;
+    let root = null;
+    while (current) {
+      const uuid = typeof current.uuid === 'string' && current.uuid
+        ? current.uuid
+        : null;
+      if (uuid) {
+        if (rootCache.has(uuid)) {
+          root = rootCache.get(uuid);
+          break;
+        }
+        if (positions.has(uuid)) {
+          const cycle = trail.slice(positions.get(uuid));
+          root = [...cycle].sort()[0];
+          break;
+        }
+        positions.set(uuid, trail.length);
+        trail.push(uuid);
+      }
+      if (typeof current.parentUuid === 'string' && byUuid.has(current.parentUuid)) {
+        current = byUuid.get(current.parentUuid);
+        continue;
+      }
+      root = uuid ?? `unidentified-${sidechainIndexes.get(current) ?? sidechainIndexes.get(entry) ?? 0}`;
+      break;
+    }
+    root ??= `unidentified-${sidechainIndexes.get(entry) ?? 0}`;
+    for (const uuid of trail) rootCache.set(uuid, root);
+    return root;
   };
   const chains = new Map();
   for (const o of sidechainLines) {
@@ -545,8 +694,16 @@ export function parseClaudeCodeFile(file, projectDir, maxBytes = maxTranscriptBy
     child.intrinsicParent = main.id;
     child.cwd = main.cwd;
     const pending = new Map();
-    chain.sort((a, b) => String(a.timestamp ?? '').localeCompare(String(b.timestamp ?? '')));
-    for (const obj of chain) ccParseMessageInto(child, pending, obj, diagnostics);
+    chain.sort((a, b) => (
+      (normalizedTimestamp(a.timestamp) ?? '').localeCompare(normalizedTimestamp(b.timestamp) ?? '')
+    ));
+    for (const obj of chain) {
+      try {
+        ccParseMessageInto(child, pending, obj, diagnostics);
+      } catch {
+        diagnostics.rowErrors++;
+      }
+    }
     if (!child.events.length) continue;
     if (!child.label) child.label = '(sub-agent)';
     main.children.push(child.id);
@@ -556,7 +713,7 @@ export function parseClaudeCodeFile(file, projectDir, maxBytes = maxTranscriptBy
     const firstUser = child.events.find((e) => e.kind === 'user')?.text ?? '';
     for (const ev of main.events) {
       if (ev.kind !== 'tool' || ev.tool.spawnTarget || !SPAWN_TOOL_RE.test(ev.tool.name)) continue;
-      const prompt = ev.tool.args?.prompt ?? '';
+      const prompt = typeof ev.tool.args?.prompt === 'string' ? ev.tool.args.prompt : '';
       if (prompt && firstUser && (prompt.startsWith(firstUser.slice(0, 60)) || firstUser.startsWith(prompt.slice(0, 60)))) {
         ev.tool.spawnTarget = child.id;
         ev.tool.intrinsicSpawnTarget = child.id;
@@ -623,13 +780,19 @@ export function parseCodexFile(file, maxBytes = maxTranscriptBytes()) {
   let previousUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
   const { diagnostics } = readJsonLines(file, maxBytes, (obj, rowDiagnostics) => {
-    const ts = obj.timestamp ?? null;
+    const ts = normalizedTimestamp(obj.timestamp);
+    if (
+      Object.hasOwn(obj, 'payload')
+      && (!obj.payload || typeof obj.payload !== 'object' || Array.isArray(obj.payload))
+    ) {
+      throw new TypeError('Codex payload must be an object');
+    }
     const p = obj.payload ?? obj; // older codex versions have no payload wrapper
     const type = p.type ?? obj.type;
 
     if (obj.type === 'session_meta') {
       if (Object.hasOwn(p, 'id')) assignSessionId(session, p.id, rowDiagnostics);
-      if (p.cwd) {
+      if (typeof p.cwd === 'string' && p.cwd) {
         session.cwd = p.cwd;
         session.agent = path.basename(p.cwd);
       }
@@ -652,10 +815,10 @@ export function parseCodexFile(file, maxBytes = maxTranscriptBytes()) {
       if (type === 'token_count' && p.info?.total_token_usage) {
         const u = p.info.total_token_usage;
         const current = {
-          input: Math.max(0, u.input_tokens ?? 0),
-          output: Math.max(0, u.output_tokens ?? 0),
-          cacheRead: Math.max(0, u.cached_input_tokens ?? 0),
-          cacheWrite: Math.max(0, u.cache_creation_input_tokens ?? 0),
+          input: tokenCount(u.input_tokens),
+          output: tokenCount(u.output_tokens),
+          cacheRead: tokenCount(u.cached_input_tokens),
+          cacheWrite: tokenCount(u.cache_creation_input_tokens),
         };
         const reset = Object.keys(current).some((key) => current[key] < previousUsage[key]);
         const delta = Object.fromEntries(
@@ -674,10 +837,10 @@ export function parseCodexFile(file, maxBytes = maxTranscriptBytes()) {
     }
     if (obj.type !== 'response_item' && obj.type !== undefined && !p.role && !type) return;
 
-    touch(session, ts);
     if (type === 'message') {
       const text = blocksOf(p.content).map((b) => b.text ?? '').filter(Boolean).join('\n');
       if (!text) return;
+      touch(session, ts);
       const injected = isInjectedMetadataText(text);
       if (p.role === 'user' && !injected) {
         session.stats.messages++;
@@ -688,16 +851,22 @@ export function parseCodexFile(file, maxBytes = maxTranscriptBytes()) {
         session.events.push({ kind: 'assistant', ts, text });
       }
     } else if (type === 'reasoning') {
-      const text = (p.summary ?? []).map((b) => b.text ?? '').filter(Boolean).join('\n');
-      if (text) session.events.push({ kind: 'thinking', ts, text });
+      const text = blocksOf(p.summary).map((b) => b.text ?? '').filter(Boolean).join('\n');
+      if (text) {
+        touch(session, ts);
+        session.events.push({ kind: 'thinking', ts, text });
+      }
     } else if (type === 'function_call' || type === 'custom_tool_call') {
       let args = p.arguments ?? p.input ?? {};
       if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = { input: args }; } }
+      touch(session, ts);
       addToolCall(session, pending, ts, { id: p.call_id ?? p.id, name: p.name ?? 'tool', args });
     } else if (type === 'function_call_output' || type === 'custom_tool_call_output') {
       const out = codexOutput(p.output ?? '');
+      touch(session, ts);
       attachResult(session, pending, p.call_id ?? p.id, out.text, out.isError, ts, rowDiagnostics);
     } else if (type === 'web_search_call') {
+      touch(session, ts);
       addToolCall(session, pending, ts, { id: p.id, name: 'web_search', args: p.action ?? {} });
     }
   });
@@ -802,18 +971,20 @@ export function parseCursorFile(file, agent = 'cursor', {
   };
 
   const { diagnostics } = readJsonLines(file, maxBytes, (obj, rowDiagnostics) => {
-    const ts = obj.timestamp ?? obj.created_at ?? obj.createdAt ?? fallbackTimestamp;
-    touch(session, ts);
+    const ts = normalizedTimestamp(
+      obj.timestamp ?? obj.created_at ?? obj.createdAt ?? fallbackTimestamp,
+    );
 
     // Native Cursor IDE agent transcript record.
     if ((obj.role === 'user' || obj.role === 'assistant') && Array.isArray(obj.message?.content)) {
-      flushAssistantDelta();
       const role = obj.role;
       const text = obj.message.content
         .filter((block) => block?.type === 'text')
         .map((block) => block.text ?? '')
         .filter(Boolean)
         .join('\n');
+      touch(session, ts);
+      flushAssistantDelta();
       if (role === 'user') {
         nativeTurnTools = [];
         if (text && !isInjectedMetadataText(text)) {
@@ -838,6 +1009,7 @@ export function parseCursorFile(file, agent = 'cursor', {
     }
 
     if (obj.type === 'turn_ended') {
+      touch(session, ts);
       flushAssistantDelta();
       if (obj.status === 'error' || obj.error != null) {
         session.stats.errors++;
@@ -855,6 +1027,7 @@ export function parseCursorFile(file, agent = 'cursor', {
 
     // Cursor CLI --output-format stream-json record.
     if (obj.type === 'system' && obj.subtype === 'init') {
+      touch(session, ts);
       flushAssistantDelta();
       if (Object.hasOwn(obj, 'session_id')) assignSessionId(session, obj.session_id, rowDiagnostics);
       if (typeof obj.cwd === 'string') {
@@ -865,8 +1038,12 @@ export function parseCursorFile(file, agent = 'cursor', {
       return;
     }
     if (obj.type === 'user') {
-      flushAssistantDelta();
+      if (!obj.message || typeof obj.message !== 'object' || Array.isArray(obj.message)) {
+        throw new TypeError('Cursor user message must be an object');
+      }
       const text = textOf(obj.message?.content);
+      touch(session, ts);
+      flushAssistantDelta();
       if (text && !isInjectedMetadataText(text)) {
         session.stats.messages++;
         session.events.push({ kind: 'user', ts, text });
@@ -875,7 +1052,11 @@ export function parseCursorFile(file, agent = 'cursor', {
       return;
     }
     if (obj.type === 'assistant') {
+      if (!obj.message || typeof obj.message !== 'object' || Array.isArray(obj.message)) {
+        throw new TypeError('Cursor assistant message must be an object');
+      }
       const text = textOf(obj.message?.content);
+      touch(session, ts);
       if (text) {
         if (!assistantDelta) assistantDelta = { ts, text: '' };
         assistantDelta.text += text;
@@ -883,9 +1064,15 @@ export function parseCursorFile(file, agent = 'cursor', {
       return;
     }
     if (obj.type === 'tool_call') {
-      flushAssistantDelta();
       const call = cursorCliTool(obj.tool_call);
       const callId = obj.call_id ?? obj.tool_call_id ?? null;
+      const completedResult = obj.subtype === 'completed'
+        || obj.subtype === 'failed'
+        || call.result != null
+        ? cursorToolResult(call.result ?? obj.result)
+        : null;
+      touch(session, ts);
+      flushAssistantDelta();
       let event = callId ? pending.get(callId) : null;
       if (!event) {
         event = addToolCall(session, pending, ts, {
@@ -894,14 +1081,13 @@ export function parseCursorFile(file, agent = 'cursor', {
           args: call.args,
         });
       }
-      if (obj.subtype === 'completed' || obj.subtype === 'failed' || call.result != null) {
-        const result = cursorToolResult(call.result ?? obj.result);
+      if (completedResult) {
         attachResult(
           session,
           pending,
           callId,
-          result.text,
-          result.isError || obj.subtype === 'failed',
+          completedResult.text,
+          completedResult.isError || obj.subtype === 'failed',
           ts,
           rowDiagnostics,
           event,
@@ -910,6 +1096,7 @@ export function parseCursorFile(file, agent = 'cursor', {
       return;
     }
     if (obj.type === 'result') {
+      touch(session, ts);
       flushAssistantDelta();
       if (obj.is_error === true || obj.subtype === 'error') session.stats.errors++;
       assignSessionModel(session, obj.model);
@@ -987,7 +1174,7 @@ const GEMINI_TOOL_NAMES = {
 };
 
 function geminiToolName(value) {
-  const name = String(value ?? 'tool');
+  const name = typeof value === 'string' && value ? value : 'tool';
   return GEMINI_TOOL_NAMES[name] ?? name;
 }
 
@@ -995,14 +1182,15 @@ function geminiContent(value) {
   const text = textOf(value);
   if (text) return text;
   if (value == null) return '';
-  try { return JSON.stringify(value); } catch { return String(value); }
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try { return JSON.stringify(value); } catch { return ''; }
 }
 
 function geminiTokens(value) {
   if (!value || typeof value !== 'object') return null;
-  const input = Math.max(0, Number(value.input_tokens ?? value.input ?? 0) || 0);
-  const output = Math.max(0, Number(value.output_tokens ?? value.output ?? 0) || 0);
-  const cacheRead = Math.max(0, Number(value.cached ?? value.cache_read_input_tokens ?? 0) || 0);
+  const input = tokenCount(value.input_tokens ?? value.input);
+  const output = tokenCount(value.output_tokens ?? value.output);
+  const cacheRead = tokenCount(value.cached ?? value.cache_read_input_tokens);
   if (input === 0 && output === 0 && cacheRead === 0) return null;
   return {
     input,
@@ -1025,63 +1213,98 @@ function geminiThoughtText(thought) {
 function parseGeminiMessages(session, messages, diagnostics) {
   const pending = new Map();
   for (const message of messages) {
-    if (!message || typeof message !== 'object') continue;
-    const ts = message.timestamp ?? null;
-    touch(session, ts);
-    const text = geminiContent(message.content);
-    if (message.type === 'user') {
-      if (text && !isInjectedMetadataText(text)) {
-        session.stats.messages++;
-        session.events.push({ kind: 'user', ts, text });
-        if (!session.label) session.label = text.slice(0, 100);
+    try {
+      if (!message || typeof message !== 'object' || Array.isArray(message)) {
+        diagnostics.invalidRows++;
+        continue;
       }
-      continue;
-    }
-    if (message.type === 'gemini') {
-      session.stats.messages++;
-      const messageModel = assignSessionModel(session, message.model);
-      if (text) session.events.push({ kind: 'assistant', ts, text });
-      const tokens = geminiTokens(message.tokens);
-      if (tokens) appendUsage(session, tokens, ts, messageModel ?? session.model);
-      for (const thought of message.thoughts ?? []) {
-        const thoughtText = geminiThoughtText(thought);
-        if (thoughtText) {
-          session.events.push({
-            kind: 'thinking',
-            ts: thought.timestamp ?? ts,
-            text: thoughtText,
-          });
+      if (!['user', 'gemini', 'error', 'warning', 'info'].includes(message.type)) continue;
+      const ts = normalizedTimestamp(message.timestamp);
+      const text = geminiContent(message.content);
+      const thoughts = message.type === 'gemini'
+        ? message.thoughts == null
+          ? []
+          : Array.isArray(message.thoughts)
+            ? message.thoughts
+            : (() => { throw new TypeError('Gemini thoughts must be an array'); })()
+        : [];
+      const calls = message.type === 'gemini'
+        ? message.toolCalls == null
+          ? []
+          : Array.isArray(message.toolCalls)
+            ? message.toolCalls
+            : (() => { throw new TypeError('Gemini toolCalls must be an array'); })()
+        : [];
+      const preparedCalls = calls.map((call) => {
+        if (!call || typeof call !== 'object' || Array.isArray(call)) {
+          throw new TypeError('Gemini tool call must be an object');
         }
-      }
-      for (const call of message.toolCalls ?? []) {
-        const callTs = call.timestamp ?? ts;
-        const event = addToolCall(session, pending, callTs, {
-          id: call.id ?? null,
-          name: geminiToolName(call.name),
-          args: call.args ?? {},
-        });
-        const status = String(call.status ?? '').toLowerCase();
+        const status = typeof call.status === 'string' ? call.status.toLowerCase() : '';
         const isError = status === 'error' || status === 'cancelled';
-        if (call.result != null || isError) {
-          attachResult(
-            session,
-            pending,
-            call.id ?? null,
-            geminiContent(call.result) || (isError ? status : ''),
-            isError,
-            callTs,
-            diagnostics,
-            event,
-          );
-        } else if (status === 'success') {
-          event.tool.confirmed = true;
+        return {
+          call,
+          status,
+          isError,
+          resultText: call.result != null
+            ? geminiContent(call.result)
+            : isError ? status : '',
+        };
+      });
+      touch(session, ts);
+      if (message.type === 'user') {
+        if (text && !isInjectedMetadataText(text)) {
+          session.stats.messages++;
+          session.events.push({ kind: 'user', ts, text });
+          if (!session.label) session.label = text.slice(0, 100);
         }
+        continue;
       }
-      continue;
-    }
-    if (message.type === 'error') session.stats.errors++;
-    if (['error', 'warning', 'info'].includes(message.type) && text) {
-      session.events.push({ kind: 'meta', ts, text });
+      if (message.type === 'gemini') {
+        session.stats.messages++;
+        const messageModel = assignSessionModel(session, message.model);
+        if (text) session.events.push({ kind: 'assistant', ts, text });
+        const tokens = geminiTokens(message.tokens);
+        if (tokens) appendUsage(session, tokens, ts, messageModel ?? session.model);
+        for (const thought of thoughts) {
+          const thoughtText = geminiThoughtText(thought);
+          if (thoughtText) {
+            session.events.push({
+              kind: 'thinking',
+              ts: normalizedTimestamp(thought.timestamp) ?? ts,
+              text: thoughtText,
+            });
+          }
+        }
+        for (const { call, status, isError, resultText } of preparedCalls) {
+          const callTs = call.timestamp ?? ts;
+          const event = addToolCall(session, pending, callTs, {
+            id: call.id ?? null,
+            name: geminiToolName(call.name),
+            args: call.args ?? {},
+          });
+          if (resultText || isError) {
+            attachResult(
+              session,
+              pending,
+              call.id ?? null,
+              resultText,
+              isError,
+              callTs,
+              diagnostics,
+              event,
+            );
+          } else if (status === 'success') {
+            event.tool.confirmed = true;
+          }
+        }
+        continue;
+      }
+      if (message.type === 'error') session.stats.errors++;
+      if (text) {
+        session.events.push({ kind: 'meta', ts, text });
+      }
+    } catch {
+      diagnostics.rowErrors++;
     }
   }
 }
@@ -1125,8 +1348,11 @@ export function parseGeminiFile(file, agent = 'gemini', {
     : readJsonLines;
   const { diagnostics } = readRecords(file, maxBytes, (obj, rowDiagnostics) => {
     if (typeof obj.type === 'string' && ['init', 'message', 'tool_use', 'tool_result', 'error', 'result'].includes(obj.type)) {
+      const ts = normalizedTimestamp(obj.timestamp);
+      if (obj.type === 'message' && obj.content != null && typeof obj.content !== 'string') {
+        throw new TypeError('Gemini stream message content must be a string');
+      }
       sawStreamEvent = true;
-      const ts = obj.timestamp ?? null;
       touch(session, ts);
       if (obj.type === 'init') {
         flushAssistantDelta();
@@ -1178,7 +1404,9 @@ export function parseGeminiFile(file, agent = 'gemini', {
       if (obj.type === 'error') {
         flushAssistantDelta();
         if (obj.severity === 'error') session.stats.errors++;
-        if (obj.message) session.events.push({ kind: 'meta', ts, text: String(obj.message) });
+        if (typeof obj.message === 'string' && obj.message) {
+          session.events.push({ kind: 'meta', ts, text: obj.message });
+        }
         return;
       }
       if (obj.type === 'result') {
@@ -1305,13 +1533,15 @@ const IMPORT_IDENTITY = {
 };
 
 function importIdentity(value) {
-  const key = String(value ?? '').trim().toLowerCase().replaceAll('_', '-');
+  if (typeof value !== 'string' || value.length > 64) return null;
+  const key = value.trim().toLowerCase().replaceAll('_', '-');
   return IMPORT_IDENTITY[key] ?? null;
 }
 
 function firstImportId(...values) {
   for (const value of values) {
     if (value == null) continue;
+    if (typeof value !== 'string' && typeof value !== 'number') continue;
     const text = String(value).trim();
     if (text) return text;
   }
@@ -1328,6 +1558,8 @@ function assignImportedSessionId(session, runtime, rawId, diagnostics) {
 function importedTimestamp(...values) {
   for (const value of values) {
     if (value == null || value === '') continue;
+    if (typeof value !== 'string' && typeof value !== 'number') continue;
+    if (typeof value === 'string' && value.length > 128) continue;
     const numeric = Number(value);
     const ms = typeof value === 'number' || (typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value))
       ? numeric * (numeric > 10_000_000_000 ? 1 : 1000)
@@ -1339,10 +1571,11 @@ function importedTimestamp(...values) {
   return null;
 }
 
-function importedText(value) {
+function importedText(value, depth = 0) {
+  if (depth > 32) return '';
   if (typeof value === 'string') return value;
   if (Array.isArray(value)) {
-    return value.map((item) => importedText(item)).filter(Boolean).join('\n');
+    return value.map((item) => importedText(item, depth + 1)).filter(Boolean).join('\n');
   }
   if (!value || typeof value !== 'object') return '';
   return importedText(
@@ -1353,6 +1586,7 @@ function importedText(value) {
     ?? value.thinking
     ?? value.summary
     ?? '',
+    depth + 1,
   );
 }
 
@@ -1383,6 +1617,41 @@ function importedMessages(request) {
   if (Array.isArray(body.input)) return body.input;
   if (typeof body.input === 'string') return [{ role: 'user', content: body.input }];
   return [];
+}
+
+function validateImportedRow(identity, request, response) {
+  const validateToolCalls = (value, label) => {
+    if (value == null) return;
+    if (
+      !Array.isArray(value)
+      || value.some((call) => !call || typeof call !== 'object' || Array.isArray(call))
+    ) {
+      throw new TypeError(`${label} tool calls must be an array of objects`);
+    }
+  };
+  for (const message of importedMessages(request)) {
+    if (message?.content != null) blocksOf(message.content);
+  }
+  const responseMessage = response?.choices?.[0]?.message;
+  validateToolCalls(responseMessage?.tool_calls, 'OpenAI-compatible');
+  if (identity.runtime === 'Ollama') {
+    validateToolCalls(response?.message?.tool_calls, 'Ollama');
+    return;
+  }
+  if (identity.runtime === 'LM Studio') {
+    if (response?.output != null && !Array.isArray(response.output)) {
+      throw new TypeError('LM Studio output must be an array');
+    }
+    if (response?.type === 'message') blocksOf(response.content);
+    return;
+  }
+  if (identity.provider === 'anthropic') {
+    blocksOf(response?.content);
+    return;
+  }
+  if (response?.output != null && !Array.isArray(response.output)) {
+    throw new TypeError('OpenAI-compatible output must be an array');
+  }
 }
 
 function lastMessageIndex(messages, role) {
@@ -1452,13 +1721,13 @@ function importedOpenAiUsage(session, response, ts, model) {
   const usage = response?.usage
     ?? ((response?.input_tokens != null || response?.output_tokens != null) ? response : null);
   if (!usage) return;
-  const input = Math.max(0, Number(usage.input_tokens ?? usage.prompt_tokens) || 0);
-  const output = Math.max(0, Number(usage.output_tokens ?? usage.completion_tokens) || 0);
-  const cacheRead = Math.max(0, Number(
+  const input = tokenCount(usage.input_tokens ?? usage.prompt_tokens);
+  const output = tokenCount(usage.output_tokens ?? usage.completion_tokens);
+  const cacheRead = tokenCount(
     usage.input_tokens_details?.cached_tokens
     ?? usage.prompt_tokens_details?.cached_tokens
     ?? usage.input_cached_tokens,
-  ) || 0);
+  );
   appendUsage(session, {
     input,
     output,
@@ -1483,9 +1752,9 @@ function importedOpenAiResponse(session, pending, response, ts) {
     if (thinking) thoughts.push(thinking);
     for (const call of message.tool_calls ?? []) {
       toolCalls.push({
-        id: call.id,
-        name: call.function?.name ?? call.name ?? 'tool',
-        args: importedArgs(call.function?.arguments ?? call.arguments),
+        id: call?.id,
+        name: call?.function?.name ?? call?.name ?? 'tool',
+        args: importedArgs(call?.function?.arguments ?? call?.arguments),
       });
     }
   }
@@ -1517,9 +1786,10 @@ function importedOpenAiResponse(session, pending, response, ts) {
 
 function importedAnthropicResponse(session, pending, response, ts, diagnostics) {
   if (!response || typeof response !== 'object') return;
+  const blocks = blocksOf(response.content);
   assignSessionModel(session, response.model);
   session.stats.messages++;
-  for (const block of blocksOf(response.content)) {
+  for (const block of blocks) {
     if (block?.type === 'text' && block.text) {
       session.events.push({ kind: 'assistant', ts, text: block.text });
     } else if (['thinking', 'redacted_thinking'].includes(block?.type)) {
@@ -1557,14 +1827,14 @@ function importedOllamaResponse(session, pending, response, ts, rowIndex) {
   if (text) session.events.push({ kind: 'assistant', ts, text });
   for (const [index, call] of (message.tool_calls ?? []).entries()) {
     addToolCall(session, pending, ts, {
-      id: call.id ?? `ollama-${rowIndex}-${index}`,
-      name: call.function?.name ?? call.name ?? 'tool',
-      args: call.function?.arguments ?? call.arguments ?? {},
+      id: call?.id ?? `ollama-${rowIndex}-${index}`,
+      name: call?.function?.name ?? call?.name ?? 'tool',
+      args: call?.function?.arguments ?? call?.arguments ?? {},
     });
   }
   appendUsage(session, {
-    input: Math.max(0, Number(response.prompt_eval_count) || 0),
-    output: Math.max(0, Number(response.eval_count) || 0),
+    input: tokenCount(response.prompt_eval_count),
+    output: tokenCount(response.eval_count),
     cacheRead: 0,
     cacheWrite: 0,
     cacheWrite5m: 0,
@@ -1601,7 +1871,7 @@ function importedLmStudioResponse(session, pending, response, ts, rowIndex) {
         name: item.metadata?.tool_name ?? 'invalid_tool_call',
         args: item.metadata?.arguments ?? {},
       });
-      event.tool.result = item.reason ?? 'Invalid tool call';
+      event.tool.result = importedText(item.reason) || 'Invalid tool call';
       event.tool.resultTs = ts;
       event.tool.isError = true;
       session.stats.errors++;
@@ -1610,8 +1880,8 @@ function importedLmStudioResponse(session, pending, response, ts, rowIndex) {
   const stats = response.stats;
   if (stats) {
     appendUsage(session, {
-      input: Math.max(0, Number(stats.input_tokens) || 0),
-      output: Math.max(0, Number(stats.total_output_tokens) || 0),
+      input: tokenCount(stats.input_tokens),
+      output: tokenCount(stats.total_output_tokens),
       cacheRead: 0,
       cacheWrite: 0,
       cacheWrite5m: 0,
@@ -1634,6 +1904,8 @@ export function parseApiLogFile(file, agent = 'imports', maxBytes = maxTranscrip
     if (!identity) return;
     const responseEnvelope = row.response?.body ?? row.response ?? row.result ?? null;
     const request = row.request?.body ?? row.request ?? null;
+    const response = responseEnvelope ?? row;
+    validateImportedRow(identity, request, response);
     const inferredSessionId = firstImportId(
       row.session_id,
       row.sessionId,
@@ -1658,7 +1930,6 @@ export function parseApiLogFile(file, agent = 'imports', maxBytes = maxTranscrip
       sessions.set(groupKey, entry);
     }
     const { session, pending } = entry;
-    const response = responseEnvelope ?? row;
     const model = assignSessionModel(
       session,
       request?.model ?? response?.model ?? response?.model_instance_id ?? row.model,
@@ -1686,7 +1957,10 @@ export function parseApiLogFile(file, agent = 'imports', maxBytes = maxTranscrip
       importedOpenAiResponse(session, pending, response, ts);
     }
 
-    const statusCode = Number(row.status_code ?? row.response?.status_code);
+    const rawStatusCode = row.status_code ?? row.response?.status_code;
+    const statusCode = typeof rawStatusCode === 'string' || typeof rawStatusCode === 'number'
+      ? Number(rawStatusCode)
+      : Number.NaN;
     const error = row.error ?? response?.error;
     if (error || (Number.isFinite(statusCode) && statusCode >= 400)) {
       session.stats.errors++;

@@ -1,6 +1,6 @@
 {
   "name": "runlume",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Local-first analytics for AI coding sessions, provider cost, code impact, workflow, and timelines.",
   "type": "module",
   "files": [
@@ -10,7 +10,8 @@
     "pricing.json",
     "public/",
     "sample/",
-    "docs/",
+    "docs/architecture.md",
+    "docs/reference.md",
     "CHANGELOG.md",
     "SECURITY.md"
   ],
@@ -20,11 +21,13 @@
   "scripts": {
     "start": "node server.mjs",
     "sample": "node sample/generate.mjs && node server.mjs --import-dir ./sample-data --sources api-log --all",
-    "check": "node --check server.mjs && node --check adapters.mjs && node --check analytics.mjs && node --check public/app.js && node --check scripts/package-smoke.mjs && node --check test/e2e/dashboard.e2e.mjs",
+    "check": "node --check server.mjs && node --check adapters.mjs && node --check analytics.mjs && node --check public/app.js && node --check scripts/capture-demo.mjs && node --check scripts/generate-sbom.mjs && node --check scripts/package-smoke.mjs && node --check test/e2e/dashboard.e2e.mjs",
     "test": "node --test test/adapters.test.mjs test/analytics.test.mjs test/server.test.mjs",
     "test:e2e": "node --test test/e2e/dashboard.e2e.mjs",
     "test:package": "node scripts/package-smoke.mjs",
-    "capture:demo": "node scripts/capture-demo.mjs"
+    "sbom": "node scripts/generate-sbom.mjs",
+    "capture:demo": "node scripts/capture-demo.mjs",
+    "prepublishOnly": "npm run check && npm test && npm run test:package"
   },
   "devDependencies": {
     "axe-core": "4.12.1",
@@ -49,7 +52,7 @@
     "nemotron",
     "qwen"
   ],
-  "packageManager": "pnpm@11.9.0",
+  "packageManager": "pnpm@11.9.0+sha512.vWgtXQP+Ul73yf1ngMaITR51asTJyf4AxTh4KCQxDc+Q493E9Tg18G3669UIXkGFXgvLs7YN4qxburieUDbwOw==",
   "author": "Malav Patel",
   "license": "MIT",
   "repository": {

@@ -4,16 +4,20 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { gunzipSync } from 'node:zlib';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PACKAGE = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+const EXPECTED_FILES = JSON.parse(
+  fs.readFileSync(path.join(ROOT, 'scripts', 'package-files.json'), 'utf8'),
+);
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'runlume-package-'));
 const archiveDirectory = path.join(temporary, 'archive');
 const installDirectory = path.join(temporary, 'install');
 fs.mkdirSync(archiveDirectory);
 fs.mkdirSync(installDirectory);
 
-function managerCommand(args, cwd) {
+function managerCommand(args, cwd, extraEnvironment = {}) {
   const configuredScript = process.env.npm_execpath;
   assert.ok(configuredScript, 'run this check through npm or pnpm');
   const managerScript = fs.realpathSync(configuredScript);
@@ -24,7 +28,7 @@ function managerCommand(args, cwd) {
     {
       cwd,
       encoding: 'utf8',
-      env: { ...process.env, NO_UPDATE_NOTIFIER: '1' },
+      env: { ...process.env, NO_UPDATE_NOTIFIER: '1', ...extraEnvironment },
       shell: false,
     },
   );
@@ -36,11 +40,42 @@ function managerCommand(args, cwd) {
   return result;
 }
 
+function archiveFiles(archive) {
+  const tar = gunzipSync(fs.readFileSync(archive));
+  const files = [];
+  for (let offset = 0; offset + 512 <= tar.length;) {
+    const header = tar.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+    const readString = (start, length) => header
+      .subarray(start, start + length)
+      .toString('utf8')
+      .replace(/\0.*$/s, '');
+    const name = readString(0, 100);
+    const prefix = readString(345, 155);
+    const sizeText = readString(124, 12).trim();
+    const size = sizeText ? Number.parseInt(sizeText, 8) : 0;
+    assert.equal(Number.isSafeInteger(size) && size >= 0, true, `invalid tar size for ${name}`);
+    const type = String.fromCharCode(header[156] || 0);
+    if (type === '\0' || type === '0') files.push(prefix ? `${prefix}/${name}` : name);
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  return files.sort();
+}
+
 try {
-  managerCommand(['pack', '--pack-destination', archiveDirectory], ROOT);
+  managerCommand(
+    ['pack', '--pack-destination', archiveDirectory],
+    ROOT,
+    { npm_config_ignore_scripts: 'true' },
+  );
   const archives = fs.readdirSync(archiveDirectory).filter((name) => name.endsWith('.tgz'));
   assert.equal(archives.length, 1, 'pack must create exactly one archive');
   const archive = path.join(archiveDirectory, archives[0]);
+  assert.deepEqual(
+    archiveFiles(archive),
+    [...EXPECTED_FILES].sort(),
+    'packed file list must match scripts/package-files.json exactly',
+  );
 
   fs.writeFileSync(
     path.join(installDirectory, 'package.json'),
@@ -67,6 +102,19 @@ try {
   const help = spawnSync(process.execPath, [server, '--help'], { encoding: 'utf8' });
   assert.equal(help.status, 0, help.stderr);
   assert.match(help.stdout, /RunLume/);
+  const bin = path.join(
+    installDirectory,
+    'node_modules',
+    '.bin',
+    process.platform === 'win32' ? 'runlume.cmd' : 'runlume',
+  );
+  assert.equal(fs.existsSync(bin), true, 'installed package must expose the runlume bin');
+  const binVersion = spawnSync(bin, ['--version'], {
+    encoding: 'utf8',
+    shell: process.platform === 'win32',
+  });
+  assert.equal(binVersion.status, 0, binVersion.stderr);
+  assert.equal(binVersion.stdout.trim(), PACKAGE.version);
 
   console.log(`Packed, installed, and executed ${PACKAGE.name}@${PACKAGE.version}`);
 } finally {

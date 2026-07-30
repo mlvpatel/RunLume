@@ -74,6 +74,31 @@ jobs:
         env:
           E2E_BROWSER: webkit
 
+  security:
+    name: Dependency audit and SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --audit-level high
+      - run: pnpm run sbom -- runlume.cdx.json
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: runlume-cyclonedx-sbom
+          path: runlume.cdx.json
+          if-no-files-found: error
+          retention-days: 14
+
   package:
     name: Packed artifact
     runs-on: ubuntu-latest
@@ -86,3 +111,56 @@ jobs:
         with:
           node-version: 24
       - run: npm run test:package
+
+  release:
+    name: Signed release assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [unit, browser, security, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build release assets
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node -e "const p=require('./package.json'); if ('v'+p.version !== process.env.RELEASE_TAG) throw new Error('tag does not match package version')"
+          npm pack --ignore-scripts
+          mv "runlume-${RELEASE_TAG#v}.tgz" "runlume-${RELEASE_TAG}.tgz"
+          pnpm run sbom -- runlume.cdx.json
+          sha256sum "runlume-${RELEASE_TAG}.tgz" runlume.cdx.json > SHA256SUMS
+      - name: Attest build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-checksums: SHA256SUMS
+      - name: Attest package SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: runlume-${{ github.ref_name }}.tgz
+          sbom-path: runlume.cdx.json
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "runlume-${GITHUB_REF_NAME}.tgz#npm package" \
+            "runlume.cdx.json#CycloneDX SBOM" \
+            "SHA256SUMS#SHA-256 checksums" \
+            --verify-tag \
+            --generate-notes \
+            --title "RunLume ${GITHUB_REF_NAME}"

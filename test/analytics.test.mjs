@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {
   buildStats,
+  calendarWindowStart,
   dayKey,
   diffLineCounts,
   extractEditOperations,
@@ -87,6 +88,354 @@ test('extractEditOperations understands Claude Edit and embedded Codex patches',
   assert.deepEqual(extractEditOperations(nestedFixture), [{ path: 'test/fixture.js', additions: 1, deletions: 0 }]);
 });
 
+test('patch parsing requires an edit tool or explicit apply_patch wrapper', () => {
+  const patch = `*** Begin Patch
+*** Update File: src/a.js
+@@
+-old
++new
+*** End Patch`;
+  assert.deepEqual(extractEditOperations(tool('apply_patch', { patch })), [
+    { path: 'src/a.js', additions: 1, deletions: 1 },
+  ]);
+  const unified = `--- a/src/a.js
++++ b/src/a.js
+@@ -1 +1 @@
+-old
++new`;
+  assert.deepEqual(extractEditOperations(tool('apply_patch', { patch: unified })), [
+    { path: 'src/a.js', additions: 1, deletions: 1 },
+  ]);
+  assert.deepEqual(extractEditOperations(tool('exec', {
+    input: `const patch = ${JSON.stringify(unified)};\nawait tools.apply_patch(patch);`,
+  })), [
+    { path: 'src/a.js', additions: 1, deletions: 1 },
+  ]);
+  assert.deepEqual(extractEditOperations(tool('exec', {
+    cmd: `apply_patch <<'PATCH'\n${patch}\nPATCH`,
+  })), [
+    { path: 'src/a.js', additions: 1, deletions: 1 },
+  ]);
+  assert.deepEqual(extractEditOperations(tool('exec', { input: patch })), []);
+  assert.deepEqual(extractEditOperations(tool('preview_patch', { patch })), []);
+  assert.deepEqual(extractEditOperations(tool('exec', {
+    input: `const preview = "await tools.apply_patch(patch)";\n${patch}`,
+  })), []);
+  assert.deepEqual(extractEditOperations(tool('exec', {
+    input: `// await tools.apply_patch(patch)\n${patch}`,
+  })), []);
+  for (const declaration of [
+    `function apply_patch(patch) {}\nconst preview = ${JSON.stringify(patch)};`,
+    `def apply_patch(patch):\n    return patch\npreview = ${JSON.stringify(patch)}`,
+    `apply_patch() { :; }\npreview=${JSON.stringify(patch)}`,
+    `const apply_patch = (patch) => patch;\nconst preview = ${JSON.stringify(patch)};\napply_patch(preview);`,
+  ]) {
+    assert.deepEqual(extractEditOperations(tool('exec', { input: declaration })), []);
+  }
+});
+
+test('wrapped patches are bound to the invoked argument and ignore fixture text', () => {
+  const fake = `*** Begin Patch
+*** Update File: fake.js
+@@
+-old
++new
+*** End Patch`;
+  const real = `*** Begin Patch
+*** Update File: real.js
+@@
+-old
++new
+*** End Patch`;
+  const appliedInput = [
+    `const preview = ${JSON.stringify(fake)};`,
+    `const patch = ${JSON.stringify(real)};`,
+    'await tools.apply_patch(patch);',
+  ].join('\n');
+  assert.deepEqual(extractEditOperations(tool('exec', { input: appliedInput })), [
+    { path: 'real.js', additions: 1, deletions: 1 },
+  ]);
+
+  const fixtureCommand = [
+    'cat > fixture.js <<JS',
+    'await tools.apply_patch(`*** Begin Patch',
+    '*** Update File: fake.js',
+    '@@',
+    '-old',
+    '+new',
+    '*** End Patch`)',
+    'JS',
+  ].join('\n');
+  assert.deepEqual(extractEditOperations(tool('exec_command', { cmd: fixtureCommand })), []);
+
+  const fixtureThenReal = `${fixtureCommand}
+apply_patch <<PATCH
+${real}
+PATCH`;
+  assert.deepEqual(extractEditOperations(tool('exec_command', { cmd: fixtureThenReal })), [
+    { path: 'real.js', additions: 1, deletions: 1 },
+  ]);
+
+  const shadowedInput = [
+    'function apply_patch(value) { return value; }',
+    `const patch = ${JSON.stringify(fake)};`,
+    'apply_patch(patch);',
+  ].join('\n');
+  assert.deepEqual(extractEditOperations(tool('exec', { input: shadowedInput })), []);
+});
+
+test('wrapped patch binding respects shell shadows, reassignment, and JavaScript scope', () => {
+  const fake = `*** Begin Patch
+*** Update File: fake.js
+@@
+-old
++fake
+*** End Patch`;
+  const real = `*** Begin Patch
+*** Update File: real.js
+@@
+-old
++real
+*** End Patch`;
+
+  for (const declaration of [
+    'apply_patch() { cat; }',
+    'function apply_patch { cat; }',
+  ]) {
+    const cmd = `${declaration}
+apply_patch <<PATCH
+${fake}
+PATCH`;
+    assert.deepEqual(extractEditOperations(tool('exec_command', { cmd })), []);
+  }
+
+  const explicitCommand = `apply_patch() { cat; }
+command apply_patch <<PATCH
+${real}
+PATCH`;
+  assert.deepEqual(extractEditOperations(tool('exec_command', {
+    cmd: explicitCommand,
+  })), [
+    { path: 'real.js', additions: 1, deletions: 1 },
+  ]);
+
+  const reassigned = [
+    `let patch = ${JSON.stringify(fake)};`,
+    `patch = ${JSON.stringify(real)};`,
+    'await tools.apply_patch(patch);',
+  ].join('\n');
+  assert.deepEqual(extractEditOperations(tool('exec', { input: reassigned })), [
+    { path: 'real.js', additions: 1, deletions: 1 },
+  ]);
+
+  const scoped = [
+    'const patch = "*** Begin Patch\\n*** Update File: fake.js\\n@@\\n-old\\n+fake\\n*** End Patch";',
+    'function fixture() { const patch = "*** Begin Patch\\n*** Update File: real.js\\n@@\\n-old\\n+real\\n*** End Patch"; return patch; }',
+    'await tools.apply_patch(patch);',
+  ].join('\n');
+  assert.deepEqual(extractEditOperations(tool('exec', { input: scoped })), [
+    { path: 'fake.js', additions: 1, deletions: 1 },
+  ]);
+});
+
+test('wrapped patch parsing supports nested shell and template interpolation invocations', () => {
+  const patch = `*** Begin Patch
+*** Update File: real.js
+@@
+-old
++new
+*** End Patch`;
+  const nestedShell = `bash -lc 'apply_patch <<PATCH
+${patch}
+PATCH
+'`;
+  assert.deepEqual(extractEditOperations(tool('exec_command', { cmd: nestedShell })), [
+    { path: 'real.js', additions: 1, deletions: 1 },
+  ]);
+
+  const interpolatedInput = [
+    `const patch = ${JSON.stringify(patch)};`,
+    'const result = `${await tools.apply_patch(patch)}`;',
+  ].join('\n');
+  assert.deepEqual(extractEditOperations(tool('exec', { input: interpolatedInput })), [
+    { path: 'real.js', additions: 1, deletions: 1 },
+  ]);
+});
+
+test('wrapped patch parsing rejects non-executable shell and JavaScript lookalikes', () => {
+  const patch = `*** Begin Patch
+*** Update File: fake.js
+@@
+-old
++new
+*** End Patch`;
+  for (const cmd of [
+    `# apply_patch <<PATCH
+${patch}
+PATCH`,
+    `echo apply_patch <<PATCH
+${patch}
+PATCH`,
+    `echo 'apply_patch <<PATCH
+${patch}
+PATCH
+'`,
+  ]) {
+    assert.deepEqual(extractEditOperations(tool('exec_command', { cmd })), []);
+  }
+
+  for (const invocation of [
+    'mytools.apply_patch(patch);',
+    'other_tools.apply_patch(patch);',
+    'foo.tools.apply_patch(patch);',
+    'const matcher = /apply_patch(patch)/;',
+    'const matcher = /tools.apply_patch(patch)/;',
+    'tools.apply_patch(patch && real);',
+    'tools.apply_patch(patch.replace("fake.js", "real.js"));',
+    'tools.apply_patch(patch + real);',
+  ]) {
+    const input = [
+      `const patch = ${JSON.stringify(patch)};`,
+      `const real = ${JSON.stringify(patch.replace('fake.js', 'real.js'))};`,
+      invocation,
+    ].join('\n');
+    assert.deepEqual(extractEditOperations(tool('exec', { input })), []);
+  }
+});
+
+test('wrapped patch extraction remains bounded for many invocations', { timeout: 5_000 }, () => {
+  const patch = `*** Begin Patch
+*** Update File: bounded.js
+@@
+-old
++new
+*** End Patch`;
+  const input = [
+    `const patch = ${JSON.stringify(patch)};`,
+    ...Array.from({ length: 16_000 }, () => 'await tools.apply_patch(patch);'),
+  ].join('\n');
+  const operations = extractEditOperations(tool('exec', { input }));
+  assert.equal(operations.length, 1_000);
+  assert.equal(operations.every((operation) => operation.path === 'bounded.js'), true);
+});
+
+test('unified diff headers are recognized only outside hunk bodies', () => {
+  assert.deepEqual(parsePatch(`diff --git a/src/a.js b/src/a.js
+--- a/src/a.js
++++ b/src/a.js
+@@ -1,2 +1,2 @@
+--- deleted content
++++ added content
+ keep`), [{
+    path: 'src/a.js',
+    additions: 1,
+    deletions: 1,
+  }]);
+  assert.deepEqual(parsePatch(`--- /dev/null
++++ b/src/new.js
+@@ -0,0 +1 @@
++new`), [{
+    path: 'src/new.js',
+    additions: 1,
+    deletions: 0,
+  }]);
+  assert.deepEqual(parsePatch(`--- a/src/gone.js
++++ /dev/null
+@@ -1 +0,0 @@
+-gone`), [{
+    path: 'src/gone.js',
+    additions: 0,
+    deletions: 1,
+  }]);
+  assert.deepEqual(parsePatch(`diff --git a/gone.bin b/gone.bin
+deleted file mode 100644
+Binary files a/gone.bin and /dev/null differ
+--- a/gone.bin
++++ /dev/null`), [{
+    path: 'gone.bin',
+    additions: 0,
+    deletions: 0,
+    estimated: true,
+  }]);
+  assert.deepEqual(parsePatch(`diff --git a/src/timed.js b/src/timed.js
+--- a/src/timed.js	2026-07-29 12:00:00.000000000 +0200
++++ b/src/timed.js	2026-07-30 12:00:00.000000000 +0200
+@@ -1 +1 @@
+-old
++new`), [{
+    path: 'src/timed.js',
+    additions: 1,
+    deletions: 1,
+  }]);
+  assert.deepEqual(parsePatch(`--- a/src/one.js
++++ b/src/one.js
+@@ -1 +1 @@
+-one
++ONE
+--- a/src/two.js
++++ b/src/two.js
+@@ -1 +1 @@
+-two
++TWO`), [
+    { path: 'src/one.js', additions: 1, deletions: 1 },
+    { path: 'src/two.js', additions: 1, deletions: 1 },
+  ]);
+  assert.deepEqual(parsePatch(`diff --git "a/name\\tpart.js" "b/name\\tpart.js"
+--- "a/name\\tpart.js"
++++ "b/name\\tpart.js"
+@@ -1 +1 @@
+-old
++new`), [{
+    path: 'name\tpart.js',
+    additions: 1,
+    deletions: 1,
+  }]);
+  assert.deepEqual(parsePatch(`diff --git a/gone.bin b/gone.bin
+deleted file mode 100644
+Binary files a/gone.bin and /dev/null differ`), [{
+    path: 'gone.bin',
+    additions: 0,
+    deletions: 0,
+    estimated: true,
+  }]);
+  assert.deepEqual(parsePatch(`diff --git a/dir b/file.js b/dir b/file.js
+--- a/dir b/file.js
++++ b/dir b/file.js
+@@ -1 +1 @@
+-old
++new`), [{
+    path: 'dir b/file.js',
+    additions: 1,
+    deletions: 1,
+  }]);
+  assert.deepEqual(parsePatch(`diff --git a/dir b/file.js b/new b/file.js
+similarity index 100%
+rename from dir b/file.js
+rename to new b/file.js`), [{
+    path: 'new b/file.js',
+    additions: 0,
+    deletions: 0,
+  }]);
+  const backslashPatch = String.raw`diff --git "a/back\\slash.js" "b/back\\slash.js"
+--- "a/back\\slash.js"
++++ "b/back\\slash.js"
+@@ -1 +1 @@
+-old
++new`;
+  assert.deepEqual(parsePatch(backslashPatch), [{
+    path: 'back\\slash.js',
+    additions: 1,
+    deletions: 1,
+  }]);
+  assert.deepEqual(extractEditOperations(tool('apply_patch', {
+    patch: backslashPatch,
+  })), [{
+    path: 'back\\slash.js',
+    additions: 1,
+    deletions: 1,
+  }]);
+});
+
 test('extractEditOperations understands Cursor StrReplace and Write fields', () => {
   assert.deepEqual(extractEditOperations({
     kind: 'tool',
@@ -136,6 +485,17 @@ test('replacement diffs count only changed lines and normalize project-relative 
     old_string: 'keep\nold\nsame',
     new_string: 'keep\nnew\nsame',
   }), '/workspace/project'), [{ path: 'src/a.js', additions: 1, deletions: 1 }]);
+  assert.deepEqual(extractEditOperations(tool('Edit', {
+    file_path: 'a/src.js',
+    old_string: 'old',
+    new_string: 'new',
+  })), [{ path: 'a/src.js', additions: 1, deletions: 1 }]);
+  assert.deepEqual(parsePatch(`*** Begin Patch
+*** Update File: b/src.js
+@@
+-old
++new
+*** End Patch`), [{ path: 'b/src.js', additions: 1, deletions: 1 }]);
 });
 
 test('patch moves do not create phantom files and unknown delete size is explicit', () => {
@@ -169,6 +529,21 @@ test('priceSession applies fresh input, cache, and output rates separately', () 
   assert.equal(priced.rate.id, 'gpt-5.3-codex');
 });
 
+test('Claude Fable 5 and Mythos 5 remain distinct aliases with aligned rates', () => {
+  const fable = priceSession(makeSession({
+    source: 'claude-code',
+    model: 'claude-fable-5',
+  }), pricing);
+  const mythos = priceSession(makeSession({
+    source: 'claude-code',
+    model: 'claude-mythos-5',
+  }), pricing);
+  assert.equal(fable.rate.id, 'claude-fable-5');
+  assert.equal(mythos.rate.id, 'claude-mythos-5');
+  assert.equal(fable.total, 11.4);
+  assert.equal(mythos.total, fable.total);
+});
+
 test('pricing cannot bill more cached input than the recorded input total', () => {
   const priced = priceSession(makeSession({
     usage: [{
@@ -184,6 +559,49 @@ test('pricing cannot bill more cached input than the recorded input total', () =
   assert.equal(priced.cacheRead, 10);
   assert.equal(priced.cacheWrite, 0);
   assert.equal(priced.freshInput, 0);
+});
+
+test('missing cache-read pricing is rejected and cannot fall back to the full input rate', () => {
+  const customPricing = {
+    currency: 'USD',
+    models: [{ id: 'custom-model', models: ['custom-model'], input: 10, output: 20 }],
+  };
+  assert.equal(
+    validatePricing(customPricing).some((issue) => issue.includes('cacheRead')),
+    true,
+  );
+  const priced = priceSession(makeSession({
+    model: 'custom-model',
+    stats: {
+      tokensIn: 1_000_000,
+      tokensOut: 0,
+      tokensCacheRead: 1_000_000,
+    },
+  }), customPricing);
+  assert.equal(priced.total, 0);
+  assert.equal(priced.cacheRead, 1_000_000);
+});
+
+test('non-finite calculated costs remain unpriced', () => {
+  const priced = priceSession(makeSession({
+    model: 'overflow-model',
+    stats: {
+      tokensIn: Number.MAX_SAFE_INTEGER,
+      tokensOut: 0,
+      tokensCacheRead: 0,
+    },
+  }), {
+    currency: 'USD',
+    models: [{
+      id: 'overflow-model',
+      models: ['overflow-model'],
+      input: Number.MAX_VALUE,
+      output: 0,
+    }],
+  });
+  assert.equal(priced.total, null);
+  assert.equal(priced.pricedTokens, 0);
+  assert.equal(priced.unpricedTokens, Number.MAX_SAFE_INTEGER);
 });
 
 test('Gemini Standard text usage uses source-scoped API-equivalent pricing', () => {
@@ -224,6 +642,28 @@ test('per-turn pricing selects models and effective dates without guessing unkno
   assert.equal(priced.billableTokens, 4_000_000);
   assert.equal(priced.pricedTokens, 3_000_000);
   assert.deepEqual(priced.rates.map((rate) => rate.id), ['model-a-old', 'model-a-new', 'model-b']);
+});
+
+test('model summaries preserve every effective pricing period', () => {
+  const datedPricing = {
+    currency: 'USD',
+    models: [
+      { id: 'model-a-old', models: ['model-a'], effectiveTo: '2026-01-01', input: 1, output: 1 },
+      { id: 'model-a-new', models: ['model-a'], effectiveFrom: '2026-01-01', input: 2, output: 2 },
+    ],
+  };
+  const stats = buildStats([makeSession({
+    model: 'model-a',
+    usage: [
+      { ts: '2025-12-31T12:00:00Z', model: 'model-a', input: 1_000_000, output: 0 },
+      { ts: '2026-02-01T12:00:00Z', model: 'model-a', input: 1_000_000, output: 0 },
+    ],
+    stats: { tokensIn: 2_000_000, tokensOut: 0, tokensCacheRead: 0 },
+  })], { days: Infinity, pricing: datedPricing });
+  assert.equal(stats.cost.total, 3);
+  assert.equal(stats.models[0].rate, null);
+  assert.equal(stats.models[0].rateMode, 'mixed');
+  assert.deepEqual(stats.models[0].rates.map((rate) => rate.id), ['model-a-old', 'model-a-new']);
 });
 
 test('cache-write duration tiers are priced independently', () => {
@@ -288,6 +728,84 @@ test('buildStats derives impact, churn, corrections, rework, latency, and abando
   assert.equal(stats.scoreboard.length, 2);
   assert.equal(stats.scoreboard.find((r) => r.source === 'codex').medianToolLatencyMs, 2000);
   assert.equal(stats.cost.tokenCoverage, 1);
+});
+
+test('future timestamps cannot contaminate admitted-session analytics', () => {
+  const stats = buildStats([makeSession({
+    startedAt: '2026-07-20T10:00:00Z',
+    endedAt: '2100-01-01T00:00:02Z',
+    events: [
+      { kind: 'user', ts: '2026-07-20T10:00:00Z', text: 'Inspect it' },
+      tool('Read', {}, '2026-07-20T10:01:00Z', {
+        resultTs: '2026-07-20T10:01:01Z',
+      }),
+      tool('Edit', {
+        file_path: 'future.js',
+        old_string: 'old',
+        new_string: 'new',
+      }, '2100-01-01T00:00:00Z', {
+        resultTs: '2100-01-01T00:00:01Z',
+        confirmed: true,
+      }),
+    ],
+    usage: [
+      {
+        ts: '2026-07-20T10:01:00Z',
+        model: 'gpt-5.3-codex',
+        input: 100,
+        output: 10,
+        cacheRead: 20,
+        cacheWrite: 0,
+      },
+      {
+        ts: '2100-01-01T00:00:00Z',
+        model: 'gpt-5.3-codex',
+        input: 1_000_000,
+        output: 100_000,
+        cacheRead: 0,
+        cacheWrite: 0,
+      },
+    ],
+    stats: {
+      tokensIn: 1_000_100,
+      tokensOut: 100_010,
+      tokensCacheRead: 20,
+      messages: 1,
+      toolCounts: { Read: 1, Edit: 1 },
+    },
+  })], {
+    days: 30,
+    pricing,
+    now: Date.parse('2026-07-30T12:00:00Z'),
+  });
+
+  assert.equal(stats.totals.toolCalls, 1);
+  assert.equal(stats.totals.edits, 0);
+  assert.equal(stats.totals.tokensIn, 100);
+  assert.equal(stats.totals.tokensOut, 10);
+  assert.equal(stats.records.activeDays, 1);
+  assert.equal(stats.records.busiestDay.date, '2026-07-20');
+  assert.equal(stats.workflow.abandoned, 1);
+  assert.equal(stats.cost.pricedTokens, 110);
+  assert.equal(stats.cost.unpricedTokens, 0);
+  assert.equal(stats.cost.tokenCoverage, 1);
+  assert.equal(stats.impact.files.length, 0);
+});
+
+test('large admitted latency samples do not overflow argument limits', { timeout: 10_000 }, () => {
+  const events = Array.from({ length: 130_000 }, () => tool('Read', {}));
+  const stats = buildStats([makeSession({
+    events,
+    stats: {
+      tokensIn: 0,
+      tokensOut: 0,
+      tokensCacheRead: 0,
+      tokensCacheWrite: 0,
+      toolCounts: { Read: events.length },
+    },
+  })], { days: Infinity, pricing: null });
+  assert.equal(stats.scoreboard[0].samples.toolLatencies, events.length);
+  assert.equal(stats.scoreboard[0].medianToolLatencyMs, 2_000);
 });
 
 test('failed and unfinished edit calls do not count as confirmed code impact', () => {
@@ -486,6 +1004,21 @@ test('finite reporting windows expose the calendar-series start, not an older se
   assert.equal(stats.window.spanDays, 30);
 });
 
+test('finite reporting windows use calendar arithmetic and always emit the requested days', () => {
+  const now = new Date(2026, 10, 2, 12, 0, 0);
+  const start = calendarWindowStart(now, 30);
+  const expected = new Date(now);
+  expected.setHours(0, 0, 0, 0);
+  expected.setDate(expected.getDate() - 29);
+  assert.equal(start.getTime(), expected.getTime());
+
+  const stats = buildStats([], { days: 30, pricing: null, now });
+  assert.equal(stats.perDay.length, 30);
+  assert.equal(stats.window.from, dayKey(start));
+  assert.equal(stats.window.to, dayKey(now));
+  assert.match(stats.window.mode, /latest valid activity/);
+});
+
 test('all-history series stays sparse for ancient timestamps', () => {
   const stats = buildStats([
     makeSession({
@@ -528,10 +1061,10 @@ test('pricing validation rejects malformed aliases and future model versions rem
   assert.deepEqual(validatePricing({
     currency: 'USD',
     models: [
-      { id: 'first', models: ['adjacent-model'], effectiveTo: '2026-08-01', input: 1, output: 1 },
-      { id: 'second', models: ['adjacent-model'], effectiveFrom: '2026-08-01', input: 2, output: 2 },
-      { id: 'codex-only', source: 'codex', models: ['scoped-model'], input: 1, output: 1 },
-      { id: 'gemini-only', source: 'gemini', models: ['scoped-model'], input: 2, output: 2 },
+      { id: 'first', models: ['adjacent-model'], effectiveTo: '2026-08-01', input: 1, output: 1, cacheRead: 0 },
+      { id: 'second', models: ['adjacent-model'], effectiveFrom: '2026-08-01', input: 2, output: 2, cacheRead: 0 },
+      { id: 'codex-only', source: 'codex', models: ['scoped-model'], input: 1, output: 1, cacheRead: 0 },
+      { id: 'gemini-only', source: 'gemini', models: ['scoped-model'], input: 2, output: 2, cacheRead: 0 },
     ],
   }), []);
   assert.ok(validatePricing({

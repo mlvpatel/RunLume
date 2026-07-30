@@ -35,7 +35,7 @@ node server.mjs [options]
 | `RUNLUME_MAX_TOTAL_BYTES` | Maximum accepted transcript bytes; default 640 MiB | 8 GiB |
 | `RUNLUME_MAX_EVENTS` | Maximum accepted events; default 1,000,000 | 2,000,000 |
 | `RUNLUME_MAX_SESSIONS` | Maximum accepted sessions; default 10,000 | 50,000 |
-| `RUNLUME_MIN_REFRESH_MS` | Minimum forced-rescan interval; default 2,000 ms | 1 hour |
+| `RUNLUME_MIN_REFRESH_MS` | Minimum interval between transcript rescans; default 2,000 ms | 1 hour |
 
 ## API and local-model imports
 
@@ -100,6 +100,7 @@ global row or another row for the same source and model.
 The table records its own `updatedAt` date. Check rate changes against the
 [OpenAI model catalog](https://developers.openai.com/api/docs/models),
 [Claude pricing documentation](https://platform.claude.com/docs/en/build-with-claude/prompt-caching),
+the [Claude Fable 5 and Mythos 5 announcement](https://www.anthropic.com/news/claude-fable-5-mythos-5),
 and [Gemini Developer API pricing](https://ai.google.dev/gemini-api/docs/pricing)
 before relying on a long-lived estimate.
 
@@ -124,6 +125,9 @@ cost =
 The result is divided by one million. Unknown models and events outside a
 pricing row's effective dates remain unpriced. The UI reports both
 fully-priced-session coverage and token-weighted coverage.
+Every custom row must include a numeric `cacheRead` rate. Use `0` only when
+cache-read tokens are not billable; an omitted value disables the invalid
+pricing table instead of silently over- or under-billing usage.
 
 API-equivalent cost is an estimate, not an invoice. It may exclude regional
 multipliers, long-context tiers, hosted tools, modality tiers, negotiated
@@ -144,8 +148,10 @@ are counted as additions and marked estimated. A bare delete patch identifies
 a file operation but contains no removed line count; the unknown line total
 remains zero and is marked estimated.
 
-Modern Codex patches nested in `functions.exec` JavaScript strings are decoded
-as data. They are never executed.
+Modern Codex patches nested in supported shell or JavaScript wrappers are
+decoded only when the wrapper contains an explicit `apply_patch` invocation.
+Patch-shaped preview text from other tools is ignored. Transcript code is never
+executed.
 
 ## Workflow signals
 
@@ -163,10 +169,13 @@ These are inspectable heuristics, not quality scores.
 
 ## Data windows and limits
 
-The default scan includes sessions whose latest valid activity is within 30
-days. Complete qualifying sessions are analyzed. Sources without event time,
-such as native Cursor transcripts, use file modification time for coarse
-activity and daily attribution.
+The default scan includes sessions whose latest valid activity falls within
+the current local calendar day and the preceding 29 local calendar days.
+Complete qualifying sessions are analyzed. Sources without event time, such as
+native Cursor transcripts, use file modification time for coarse activity and
+daily attribution. Headline totals therefore describe a cohort of complete
+sessions, while the daily chart includes only activity attributed to its
+visible calendar dates. The chart is not intended to sum to the cohort totals.
 
 For `--all`, aggregate totals include every accepted session while charts keep
 the latest 730 active days. The API reports when earlier days were omitted.

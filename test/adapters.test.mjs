@@ -12,8 +12,10 @@ import {
   parseGeminiFile,
   parseApiLogFile,
   parseGenericAgentFile,
+  readJsonDocument,
   readJsonLines,
 } from '../adapters.mjs';
+import { buildStats } from '../analytics.mjs';
 
 const CURSOR_FIXTURE = fileURLToPath(new URL('./fixtures/cursor/session.jsonl', import.meta.url));
 const GEMINI_FIXTURE = fileURLToPath(new URL('./fixtures/gemini/session.jsonl', import.meta.url));
@@ -28,6 +30,49 @@ function fixture(t, name, rows, malformed = false) {
   fs.writeFileSync(file, `${body}${malformed ? '\n{broken' : ''}\n`);
   return file;
 }
+
+test('JSON readers isolate callback failures to one record', (t) => {
+  const rows = [{ id: 1 }, { id: 2 }, { id: 3 }];
+  const jsonl = fixture(t, 'callback-errors.jsonl', rows);
+  const jsonlSeen = [];
+  const lineResult = readJsonLines(jsonl, undefined, (row) => {
+    jsonlSeen.push(row.id);
+    if (row.id === 2) throw new Error('sentinel local path must not escape diagnostics');
+  });
+  assert.deepEqual(jsonlSeen, [1, 2, 3]);
+  assert.equal(lineResult.diagnostics.rowErrors, 1);
+  assert.equal(lineResult.diagnostics.readError, null);
+
+  const document = fixture(t, 'callback-errors.json', []);
+  fs.writeFileSync(document, JSON.stringify(rows));
+  const documentSeen = [];
+  const documentResult = readJsonDocument(document, undefined, (row) => {
+    documentSeen.push(row.id);
+    if (row.id === 2) throw new Error('sentinel local path must not escape diagnostics');
+  });
+  assert.deepEqual(documentSeen, [1, 2, 3]);
+  assert.equal(documentResult.diagnostics.rowErrors, 1);
+  assert.equal(documentResult.diagnostics.readError, null);
+});
+
+test('transcript cwd fields must be non-empty strings', (t) => {
+  const generic = fixture(t, 'invalid-generic-cwd.jsonl', [
+    { type: 'session', id: 'generic-cwd', cwd: { path: '/private' }, timestamp: '2026-07-20T10:00:00Z' },
+    { role: 'user', content: 'Continue', timestamp: '2026-07-20T10:00:01Z' },
+  ]);
+  assert.equal(parseGenericAgentFile('hermes', generic, 'main').sessions[0].cwd, null);
+
+  const claude = fixture(t, 'invalid-claude-cwd.jsonl', [
+    { type: 'user', uuid: 'user-1', cwd: ['private'], timestamp: '2026-07-20T10:00:00Z', message: { role: 'user', content: 'Continue' } },
+  ]);
+  assert.equal(parseClaudeCodeFile(claude, 'project').sessions[0].cwd, null);
+
+  const codex = fixture(t, 'invalid-codex-cwd.jsonl', [
+    { type: 'session_meta', timestamp: '2026-07-20T10:00:00Z', payload: { id: 'codex-cwd', cwd: 42 } },
+    { type: 'response_item', timestamp: '2026-07-20T10:00:01Z', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Continue' }] } },
+  ]);
+  assert.equal(parseCodexFile(codex).sessions[0].cwd, null);
+});
 
 test('generic agent parser reports malformed lines and links structured tool errors', (t) => {
   const file = fixture(t, 'generic-agent.jsonl', [
@@ -64,6 +109,101 @@ test('valid JSON primitives are skipped without aborting later transcript rows',
   assert.equal(result.diagnostics.invalidRows, 1);
   assert.equal(result.diagnostics.readError, null);
   assert.equal(result.sessions[0].label, 'Still parsed');
+});
+
+test('invalid message rows cannot mutate later generic session activity', (t) => {
+  const file = fixture(t, 'transactional-generic-row.jsonl', [
+    { type: 'session', id: 'transactional-row', timestamp: '2026-07-20T10:00:00Z' },
+    {
+      type: 'message',
+      timestamp: '2100-01-01T00:00:00Z',
+      message: { role: 'assistant', content: [null] },
+    },
+    { type: 'message', timestamp: '2100-01-02T00:00:00Z', message: 'invalid envelope' },
+    {
+      type: 'message',
+      timestamp: '2026-07-20T10:00:02Z',
+      message: { role: 'user', content: 'Still parsed' },
+    },
+  ]);
+  const result = parseGenericAgentFile('hermes', file, 'main');
+  assert.equal(result.diagnostics.rowErrors, 2);
+  assert.equal(result.sessions.length, 1);
+  assert.equal(
+    Date.parse(result.sessions[0].endedAt),
+    Date.parse('2026-07-20T10:00:02Z'),
+  );
+  assert.equal(result.sessions[0].stats.messages, 1);
+  assert.deepEqual(result.sessions[0].events.map((event) => event.text), ['Still parsed']);
+});
+
+test('malformed future rows cannot mutate Codex, Cursor, or Gemini activity', (t) => {
+  const codexId = '11111111-1111-4111-8111-111111111111';
+  const codexFile = fixture(t, `rollout-${codexId}.jsonl`, [
+    {
+      type: 'session_meta',
+      timestamp: '2026-07-20T10:00:00Z',
+      payload: { id: codexId, cwd: '/workspace/project' },
+    },
+    {
+      type: 'response_item',
+      timestamp: '2100-01-01T00:00:00Z',
+      payload: { type: 'message', role: 'assistant', content: [null] },
+    },
+    {
+      type: 'response_item',
+      timestamp: '2026-07-20T10:00:02Z',
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Codex survives' }] },
+    },
+  ]);
+  const codex = parseCodexFile(codexFile);
+  assert.equal(codex.diagnostics.rowErrors, 1);
+  assert.equal(codex.sessions[0].endedAt, '2026-07-20T10:00:02Z');
+
+  const cursorFile = fixture(t, 'cursor-transactional.jsonl', [
+    {
+      type: 'system',
+      subtype: 'init',
+      timestamp: '2026-07-20T10:00:00Z',
+      session_id: 'cursor-transactional',
+    },
+    {
+      type: 'user',
+      timestamp: '2100-01-01T00:00:00Z',
+      message: { role: 'user', content: [null] },
+    },
+    {
+      type: 'user',
+      timestamp: '2026-07-20T10:00:02Z',
+      message: { role: 'user', content: 'Cursor survives' },
+    },
+  ]);
+  const cursor = parseCursorFile(cursorFile);
+  assert.equal(cursor.diagnostics.rowErrors, 1);
+  assert.equal(cursor.sessions[0].endedAt, '2026-07-20T10:00:02Z');
+
+  const geminiFile = fixture(t, 'gemini-transactional.json', []);
+  fs.writeFileSync(geminiFile, JSON.stringify({
+    sessionId: 'gemini-transactional',
+    projectHash: 'project',
+    messages: [
+      {
+        id: 'bad',
+        type: 'gemini',
+        timestamp: '2100-01-01T00:00:00Z',
+        content: [null],
+      },
+      {
+        id: 'good',
+        type: 'user',
+        timestamp: '2026-07-20T10:00:02Z',
+        content: 'Gemini survives',
+      },
+    ],
+  }));
+  const gemini = parseGeminiFile(geminiFile);
+  assert.equal(gemini.diagnostics.rowErrors, 1);
+  assert.equal(gemini.sessions[0].endedAt, '2026-07-20T10:00:02Z');
 });
 
 test('generic agent parser records per-turn model usage and cache-write tiers', (t) => {
@@ -220,6 +360,147 @@ test('Claude Code parser creates intrinsic sidechain relationships', (t) => {
   assert.equal(child.intrinsicParent, main.id);
   assert.deepEqual(main.intrinsicChildren, [child.id]);
   assert.equal(main.events.find((event) => event.kind === 'tool').tool.intrinsicSpawnTarget, child.id);
+});
+
+test('Claude Code sidechain grouping is stack-safe and near-linear for deep chains', { timeout: 10_000 }, (t) => {
+  const rows = [];
+  for (let index = 0; index < 10_000; index++) {
+    rows.push({
+      type: index % 2 ? 'assistant' : 'user',
+      uuid: `side-${String(index).padStart(5, '0')}`,
+      ...(index ? { parentUuid: `side-${String(index - 1).padStart(5, '0')}` } : {}),
+      isSidechain: true,
+      timestamp: new Date(Date.parse('2026-07-20T10:00:00Z') + index).toISOString(),
+      message: {
+        role: index % 2 ? 'assistant' : 'user',
+        content: index % 2 ? 'Done' : 'Continue',
+      },
+    });
+  }
+  const file = fixture(t, 'deep-claude-sidechain.jsonl', rows);
+  const result = parseClaudeCodeFile(file, 'project');
+  assert.equal(result.sessions.length, 2);
+  assert.equal(result.sessions[1].events.length, 10_000);
+  assert.equal(result.diagnostics.rowErrors, 0);
+});
+
+test('Claude Code sidechain cycles resolve to one deterministic chain', (t) => {
+  const file = fixture(t, 'cyclic-claude-sidechain.jsonl', [
+    { type: 'user', uuid: 'cycle-b', parentUuid: 'cycle-a', isSidechain: true, timestamp: '2026-07-20T10:00:00Z', message: { role: 'user', content: 'First' } },
+    { type: 'assistant', uuid: 'cycle-a', parentUuid: 'cycle-b', isSidechain: true, timestamp: '2026-07-20T10:00:01Z', message: { role: 'assistant', content: 'Second' } },
+  ]);
+  const result = parseClaudeCodeFile(file, 'project');
+  assert.equal(result.sessions.length, 2);
+  assert.deepEqual(
+    result.sessions[1].events.map((event) => event.text),
+    ['First', 'Second'],
+  );
+});
+
+test('UUID-less Claude sidechain rows inherit their known parent chain', (t) => {
+  const file = fixture(t, 'uuidless-claude-sidechain.jsonl', [
+    { type: 'user', uuid: 'root-sidechain', isSidechain: true, timestamp: '2026-07-20T10:00:00Z', message: { role: 'user', content: 'First' } },
+    { type: 'assistant', parentUuid: 'root-sidechain', isSidechain: true, timestamp: '2026-07-20T10:00:01Z', message: { role: 'assistant', content: 'Second' } },
+  ]);
+  const result = parseClaudeCodeFile(file, 'project');
+  assert.equal(result.sessions.length, 2);
+  assert.deepEqual(
+    result.sessions[1].events.map((event) => event.text),
+    ['First', 'Second'],
+  );
+});
+
+test('malformed deferred Claude sidechain rows do not abort or mutate the chain', (t) => {
+  const file = fixture(t, 'malformed-claude-sidechain.jsonl', [
+    {
+      type: 'user',
+      uuid: 'main-user',
+      timestamp: '2026-07-20T10:00:00Z',
+      message: { role: 'user', content: 'Main task' },
+    },
+    {
+      type: 'user',
+      uuid: 'side-user',
+      isSidechain: true,
+      timestamp: '2026-07-20T10:00:01Z',
+      message: { role: 'user', content: 'First' },
+    },
+    {
+      type: 'assistant',
+      uuid: 'side-bad',
+      parentUuid: 'side-user',
+      isSidechain: true,
+      timestamp: '2100-01-01T00:00:00Z',
+      message: { role: 'assistant', content: [null] },
+    },
+    {
+      type: 'assistant',
+      uuid: 'side-good',
+      parentUuid: 'side-bad',
+      isSidechain: true,
+      timestamp: '2026-07-20T10:00:02Z',
+      message: { role: 'assistant', content: 'Last' },
+    },
+  ]);
+  const result = parseClaudeCodeFile(file, 'project');
+  assert.equal(result.diagnostics.rowErrors, 1);
+  assert.equal(result.sessions.length, 2);
+  assert.equal(result.sessions[1].endedAt, '2026-07-20T10:00:02Z');
+  assert.deepEqual(result.sessions[1].events.map((event) => event.text), ['First', 'Last']);
+});
+
+test('malformed Claude task prompts and titles cannot abort sidechain linking', (t) => {
+  const file = fixture(t, 'malformed-claude-link.jsonl', [
+    { type: 'ai-title', aiTitle: { bad: true } },
+    {
+      type: 'user',
+      uuid: 'main-user',
+      timestamp: '2026-07-20T10:00:00Z',
+      message: { role: 'user', content: 'Main task' },
+    },
+    {
+      type: 'assistant',
+      uuid: 'main-assistant',
+      timestamp: '2026-07-20T10:00:01Z',
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id: 'task-bad-prompt',
+          name: 'Task',
+          input: { prompt: { bad: true } },
+        }],
+      },
+    },
+    {
+      type: 'user',
+      uuid: 'side-user',
+      parentUuid: 'task-bad-prompt',
+      isSidechain: true,
+      timestamp: '2026-07-20T10:00:02Z',
+      message: { role: 'user', content: 'Inspect safely' },
+    },
+    {
+      type: 'assistant',
+      uuid: 'side-assistant',
+      parentUuid: 'side-user',
+      isSidechain: true,
+      timestamp: '2026-07-20T10:00:03Z',
+      message: { role: 'assistant', content: 'Done' },
+    },
+  ]);
+
+  const result = parseClaudeCodeFile(file, 'project');
+  assert.equal(result.sessions.length, 2);
+  assert.equal(result.sessions[0].label, 'Main task');
+  assert.deepEqual(
+    result.sessions[1].events.map((event) => event.text),
+    ['Inspect safely', 'Done'],
+  );
+  assert.equal(
+    result.sessions[0].events.find((event) => event.kind === 'tool').tool.spawnTarget,
+    undefined,
+  );
 });
 
 test('Codex parser uses structured exit codes and cumulative token counts', (t) => {
@@ -395,7 +676,10 @@ test('Gemini saved-session parser reads messages, tokens, thoughts, and tool out
   const tools = session.events.filter((event) => event.kind === 'tool').map((event) => event.tool);
   assert.deepEqual(tools.map((tool) => tool.name), ['Edit', 'Write']);
   assert.equal(tools[0].result, 'Updated successfully');
+  assert.equal(tools[0].resultTs, '2026-07-26T11:00:03Z');
   assert.equal(tools[0].isError, false);
+  assert.equal(tools[1].result, 'Permission denied');
+  assert.equal(tools[1].resultTs, '2026-07-26T11:00:04Z');
   assert.equal(tools[1].isError, true);
 });
 
@@ -420,6 +704,74 @@ test('Gemini parser accepts pretty-printed legacy JSON documents', (t) => {
   assert.equal(result.sessions.length, 1);
   assert.equal(result.sessions[0].id, 'pretty-gemini-session');
   assert.equal(result.sessions[0].stats.messages, 2);
+});
+
+test('invalid Gemini stream-shaped rows do not suppress valid legacy data', (t) => {
+  const file = fixture(t, 'gemini-invalid-stream-then-legacy.jsonl', [
+    {
+      type: 'message',
+      timestamp: '2100-01-01T00:00:00Z',
+      role: 'assistant',
+      content: { invalid: true },
+    },
+    {
+      sessionId: 'legacy-after-invalid-stream',
+      projectHash: 'synthetic-project',
+      startTime: '2026-07-26T11:00:00Z',
+      lastUpdated: '2026-07-26T11:00:01Z',
+      messages: [
+        {
+          id: 'legacy-user',
+          type: 'user',
+          timestamp: '2026-07-26T11:00:00Z',
+          content: [{ text: 'Keep the legacy session' }],
+        },
+        {
+          id: 'legacy-assistant',
+          type: 'gemini',
+          timestamp: '2026-07-26T11:00:01Z',
+          content: [{ text: 'Preserved' }],
+        },
+      ],
+    },
+  ]);
+
+  const result = parseGeminiFile(file);
+  assert.equal(result.diagnostics.rowErrors, 1);
+  assert.equal(result.sessions.length, 1);
+  assert.equal(result.sessions[0].id, 'legacy-after-invalid-stream');
+  assert.deepEqual(
+    result.sessions[0].events.map((event) => event.text),
+    ['Keep the legacy session', 'Preserved'],
+  );
+});
+
+test('deep Gemini thought timestamps inherit the normalized message timestamp', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'runlume-gemini-thought-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'deep-thought.jsonl');
+  const deepTimestamp = `${'['.repeat(20_000)}0${']'.repeat(20_000)}`;
+  fs.writeFileSync(file, [
+    JSON.stringify({
+      sessionId: 'deep-thought-session',
+      projectHash: 'synthetic-project',
+      startTime: '2026-07-26T11:00:00Z',
+      lastUpdated: '2026-07-26T11:00:01Z',
+    }),
+    `{"id":"assistant-1","type":"gemini","timestamp":"2026-07-26T11:00:01Z","content":[{"text":"Done"}],"thoughts":[{"text":"Think","timestamp":${deepTimestamp}}]}`,
+  ].join('\n'));
+
+  const result = parseGeminiFile(file);
+  assert.equal(result.diagnostics.rowErrors, 0);
+  const session = result.sessions[0];
+  assert.equal(
+    session.events.find((event) => event.kind === 'thinking').ts,
+    '2026-07-26T11:00:01Z',
+  );
+  assert.doesNotThrow(() => buildStats([session], {
+    days: Infinity,
+    now: Date.parse('2026-07-30T12:00:00Z'),
+  }));
 });
 
 test('Gemini stream-json parser coalesces deltas, links tools, and records model usage', (t) => {
@@ -668,6 +1020,30 @@ test('API log importer normalizes OpenAI, Anthropic, Ollama, and LM Studio sessi
   assert.equal(byRuntime.get('LM Studio').events.find((event) => event.kind === 'tool').tool.confirmed, true);
 });
 
+test('LM Studio invalid tool-call reasons are normalized to display-safe text', (t) => {
+  const file = fixture(t, 'lm-studio-invalid-tool.jsonl', [{
+    provider: 'lm-studio',
+    session_id: 'lm-studio-invalid-tool',
+    timestamp: '2026-07-20T10:03:00Z',
+    request: { model: 'openai/gpt-oss-20b', input: 'Run a tool' },
+    response: {
+      model_instance_id: 'openai/gpt-oss-20b',
+      output: [{
+        type: 'invalid_tool_call',
+        metadata: { tool_name: 'run_tests', arguments: { suite: 'unit' } },
+        reason: { bad: true },
+      }],
+      stats: { input_tokens: 8, total_output_tokens: 2 },
+    },
+  }]);
+  const result = parseApiLogFile(file);
+  assert.equal(result.diagnostics.rowErrors, 0);
+  const tool = result.sessions[0].events.find((event) => event.kind === 'tool').tool;
+  assert.equal(tool.result, 'Invalid tool call');
+  assert.equal(typeof tool.result, 'string');
+  assert.equal(tool.isError, true);
+});
+
 test('API log importer attributes requested OpenAI-compatible model providers', (t) => {
   const providers = [
     ['nvidia', 'nvidia/nemotron', 'nvidia'],
@@ -691,6 +1067,74 @@ test('API log importer attributes requested OpenAI-compatible model providers', 
     result.sessions.map((session) => session.provider).sort(),
     providers.map((entry) => entry[2]).sort(),
   );
+});
+
+test('API log text extraction stops at a bounded nesting depth', (t) => {
+  let nested = 'too deep';
+  for (let depth = 0; depth < 40; depth++) nested = { content: nested };
+  const file = fixture(t, 'deep-api-content.jsonl', [{
+    provider: 'openai',
+    session_id: 'deep-content',
+    timestamp: '2026-07-20T10:00:00Z',
+    request: { model: 'gpt-5.3-codex', input: nested },
+    response: {
+      model: 'gpt-5.3-codex',
+      output_text: 'Later response still parses',
+      usage: { input_tokens: 10, output_tokens: 2 },
+    },
+  }]);
+  const result = parseApiLogFile(file);
+  assert.equal(result.diagnostics.rowErrors, 0);
+  assert.equal(result.sessions.length, 1);
+  assert.equal(
+    result.sessions[0].events.some((event) => event.text === 'Later response still parses'),
+    true,
+  );
+});
+
+test('malformed API-log rows cannot mutate an existing imported session', (t) => {
+  const file = fixture(t, 'transactional-api-log.jsonl', [
+    {
+      provider: 'openai',
+      session_id: 'transactional-api',
+      timestamp: '2026-07-20T10:00:00Z',
+      request: { model: 'gpt-5.3-codex', input: 'First' },
+      response: { model: 'gpt-5.3-codex', output_text: 'One' },
+    },
+    {
+      provider: 'openai',
+      session_id: 'transactional-api',
+      timestamp: '2099-01-01T00:00:00Z',
+      request: { model: 'poisoned-model', input: 'Bad' },
+      response: { model: 'poisoned-model', output: {} },
+    },
+    {
+      provider: 'openai',
+      session_id: 'transactional-api',
+      timestamp: '2100-01-01T00:00:00Z',
+      request: { model: 'poisoned-model', input: 'Also bad' },
+      response: {
+        model: 'poisoned-model',
+        choices: [{ message: { tool_calls: [null] } }],
+      },
+    },
+    {
+      provider: 'openai',
+      session_id: 'transactional-api',
+      timestamp: '2026-07-20T10:00:02Z',
+      request: { model: 'gpt-5.3-codex', input: 'Second' },
+      response: { model: 'gpt-5.3-codex', output_text: 'Two' },
+    },
+  ]);
+  const result = parseApiLogFile(file);
+  assert.equal(result.diagnostics.rowErrors, 2);
+  assert.equal(result.sessions.length, 1);
+  assert.equal(
+    Date.parse(result.sessions[0].endedAt),
+    Date.parse('2026-07-20T10:00:02Z'),
+  );
+  assert.equal(result.sessions[0].model, 'gpt-5.3-codex');
+  assert.equal(result.sessions[0].events.some((event) => event.text === 'Bad'), false);
 });
 
 test('API log importer gives long session identifiers stable unique fallbacks', (t) => {

@@ -4,6 +4,7 @@ node_modules/
 coverage/
 playwright-report/
 test-results/
+runlume.cdx.json
 *.log
 
 # Local configuration and credentials

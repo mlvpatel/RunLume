@@ -1,0 +1,18 @@
+[
+  "package/CHANGELOG.md",
+  "package/LICENSE",
+  "package/README.md",
+  "package/SECURITY.md",
+  "package/adapters.mjs",
+  "package/analytics.mjs",
+  "package/docs/architecture.md",
+  "package/docs/reference.md",
+  "package/package.json",
+  "package/pricing.json",
+  "package/public/app.js",
+  "package/public/favicon.svg",
+  "package/public/index.html",
+  "package/public/style.css",
+  "package/sample/generate.mjs",
+  "package/server.mjs"
+]

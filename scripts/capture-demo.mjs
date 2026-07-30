@@ -12,14 +12,18 @@ const captureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'runlume-capture-
 const rawVideo = path.join(captureDirectory, 'runlume-tour.webm');
 const preview = path.join(docs, 'runlume-preview.png');
 const providerPreview = path.join(docs, 'runlume-providers.png');
+const tour = path.join(docs, 'runlume-tour.mp4');
+const temporaryTour = path.join(docs, `.runlume-tour-${process.pid}.tmp.mp4`);
+const subtitles = path.join(docs, 'runlume-tour.en.vtt');
+const transcript = path.join(docs, 'runlume-tour-script.md');
 const capturePort = 45_873;
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-function runNode(args) {
+function runProcess(command, args, { cwd = root } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, args, {
-      cwd: root,
+    const child = spawn(command, args, {
+      cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
     });
@@ -30,9 +34,140 @@ function runNode(args) {
     child.once('error', reject);
     child.once('exit', (code) => {
       if (code === 0) resolve(stdout);
-      else reject(new Error(`${args.join(' ')} failed (${code})\n${stdout}\n${stderr}`));
+      else reject(new Error(`${path.basename(command)} failed (${code})\n${stdout}\n${stderr}`));
     });
   });
+}
+
+const runNode = (args) => runProcess(process.execPath, args);
+
+function executable(candidates, label) {
+  for (const candidate of candidates.filter(Boolean)) {
+    const resolved = path.resolve(candidate);
+    try {
+      fs.accessSync(resolved, fs.constants.X_OK);
+      if (fs.statSync(resolved).isFile()) return resolved;
+    } catch {
+      // Try the next explicit path.
+    }
+  }
+  const variable = label === 'FFprobe' ? 'RUNLUME_FFPROBE' : 'RUNLUME_FFMPEG';
+  throw new Error(
+    `${label} is required. Set ${variable} to an absolute executable path or install FFmpeg.`,
+  );
+}
+
+function narrationText() {
+  return fs.readFileSync(transcript, 'utf8')
+    .replace(/^#.*\r?\n+/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function narrationFile() {
+  if (process.env.RUNLUME_NARRATION_FILE?.trim()) {
+    const supplied = fs.realpathSync(path.resolve(process.env.RUNLUME_NARRATION_FILE));
+    assert.equal(fs.statSync(supplied).isFile(), true, 'RUNLUME_NARRATION_FILE must be a file');
+    return supplied;
+  }
+  if (process.platform !== 'darwin') {
+    throw new Error('Set RUNLUME_NARRATION_FILE when capturing outside macOS.');
+  }
+  const output = path.join(captureDirectory, 'runlume-tour-narration.aiff');
+  await runProcess('/usr/bin/say', [
+    '-v',
+    process.env.RUNLUME_NARRATOR?.trim() || 'Samantha',
+    '-r',
+    '240',
+    '-o',
+    output,
+    narrationText(),
+  ]);
+  return output;
+}
+
+async function buildTour() {
+  const ffmpeg = executable([
+    process.env.RUNLUME_FFMPEG,
+    '/opt/homebrew/bin/ffmpeg',
+    '/usr/local/bin/ffmpeg',
+    '/usr/bin/ffmpeg',
+  ], 'Full FFmpeg');
+  const ffprobe = executable([
+    process.env.RUNLUME_FFPROBE,
+    path.join(path.dirname(ffmpeg), 'ffprobe'),
+    '/opt/homebrew/bin/ffprobe',
+    '/usr/local/bin/ffprobe',
+    '/usr/bin/ffprobe',
+  ], 'FFprobe');
+  const narration = await narrationFile();
+  try {
+    await runProcess(ffmpeg, [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-y',
+      '-i',
+      rawVideo,
+      '-i',
+      narration,
+      '-i',
+      subtitles,
+      '-filter_complex',
+      '[0:v]tpad=stop_mode=clone:stop_duration=1[v];[1:a]apad=pad_dur=1[a]',
+      '-map',
+      '[v]',
+      '-map',
+      '[a]',
+      '-map',
+      '2:0',
+      '-t',
+      '29.6',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'slow',
+      '-crf',
+      '22',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
+      '-ac',
+      '1',
+      '-ar',
+      '44100',
+      '-c:s',
+      'mov_text',
+      '-metadata:s:s:0',
+      'language=eng',
+      '-metadata:s:s:0',
+      'title=English',
+      '-movflags',
+      '+faststart',
+      temporaryTour,
+    ]);
+    const inspection = JSON.parse(await runProcess(ffprobe, [
+      '-v',
+      'error',
+      '-show_entries',
+      'stream=codec_name,codec_type:format=duration',
+      '-of',
+      'json',
+      temporaryTour,
+    ]));
+    const codecs = new Set(inspection.streams?.map((stream) => stream.codec_name));
+    for (const codec of ['h264', 'aac', 'mov_text']) {
+      assert.equal(codecs.has(codec), true, `tour is missing its ${codec} stream`);
+    }
+    const duration = Number(inspection.format?.duration);
+    assert.equal(duration >= 29.5 && duration <= 29.7, true, 'tour duration must be 29.6 seconds');
+    fs.renameSync(temporaryTour, tour);
+  } finally {
+    fs.rmSync(temporaryTour, { force: true });
+  }
 }
 
 function startServer() {
@@ -120,9 +255,10 @@ try {
   const recorded = await video.path();
   assert.equal(fs.existsSync(recorded), true, 'Playwright did not produce a recording');
   fs.copyFileSync(recorded, rawVideo);
+  await buildTour();
   console.log(`Screenshot: ${preview}`);
   console.log(`Provider screenshot: ${providerPreview}`);
-  console.log(`Raw video: ${rawVideo}`);
+  console.log(`Narrated tour: ${tour}`);
 } finally {
   if (browser) await browser.close();
   if (server && server.exitCode == null) {
@@ -132,4 +268,5 @@ try {
       setTimeout(resolve, 2_000);
     });
   }
+  fs.rmSync(captureDirectory, { recursive: true, force: true });
 }

@@ -1,6 +1,8 @@
 import path from 'node:path';
 
 const MAX_ANALYTICS_PATH_LENGTH = 4096;
+export const FUTURE_TIMESTAMP_TOLERANCE_MS = 5 * 60_000;
+const GIT_PATCH_PATH = Symbol('gitPatchPath');
 
 export const EDIT_TOOLS = new Set([
   'edit', 'write', 'notebookedit', 'multiedit', 'strreplace', 'str_replace_editor', 'apply_patch',
@@ -13,6 +15,26 @@ export const dayKey = (ts) => {
   if (Number.isNaN(d.getTime())) return null;
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
+
+function analyticsTimestampMs(value) {
+  if (typeof value !== 'string' || !value || value.length > 128) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function timestampIsAfter(value, maximum) {
+  const parsed = analyticsTimestampMs(value);
+  return parsed != null && parsed > maximum;
+}
+
+export function calendarWindowStart(now, days) {
+  const start = new Date(now);
+  if (Number.isNaN(start.getTime())) throw new Error('window start requires a valid date');
+  if (!Number.isSafeInteger(days) || days < 1) throw new Error('window days must be a positive integer');
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - (days - 1));
+  return start;
+}
 
 function tokenCount(value) {
   if (
@@ -116,11 +138,11 @@ function isCaseInsensitiveProjectPath(value) {
   return typeof value === 'string' && (/^[A-Z]:\//i.test(value) || value.startsWith('//'));
 }
 
-function cleanFilePath(value, cwd = null) {
+function cleanFilePath(value, cwd = null, { preserveBackslashes = false } = {}) {
   if (typeof value !== 'string') return null;
-  let out = value.trim().replace(/^['"]|['"]$/g, '').replaceAll('\\', '/');
+  let out = value.trim().replace(/^['"]|['"]$/g, '');
+  if (!preserveBackslashes) out = out.replaceAll('\\', '/');
   if (!out || out.length > MAX_ANALYTICS_PATH_LENGTH) return null;
-  out = out.replace(/^[ab]\//, '');
   const normalizedCwd = canonicalProjectPath(cwd);
   const comparableOut = isCaseInsensitiveProjectPath(normalizedCwd) ? out.toLowerCase() : out;
   const comparableCwd = isCaseInsensitiveProjectPath(normalizedCwd) ? normalizedCwd.toLowerCase() : normalizedCwd;
@@ -129,6 +151,99 @@ function cleanFilePath(value, cwd = null) {
   }
   out = path.posix.normalize(out).replace(/^\.\//, '');
   return out && out !== '/dev/null' ? out : null;
+}
+
+function decodeGitQuotedPath(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('"')) return trimmed;
+  let output = '';
+  const octets = [];
+  const flushOctets = () => {
+    if (!octets.length) return;
+    output += Buffer.from(octets).toString('utf8');
+    octets.length = 0;
+  };
+  for (let index = 1; index < trimmed.length; index++) {
+    const character = trimmed[index];
+    if (character === '"') {
+      flushOctets();
+      return output;
+    }
+    if (character !== '\\' || index === trimmed.length - 1) {
+      flushOctets();
+      output += character;
+      continue;
+    }
+    const escaped = trimmed[++index];
+    if (/[0-7]/.test(escaped)) {
+      let octal = escaped;
+      while (octal.length < 3 && /[0-7]/.test(trimmed[index + 1] ?? '')) {
+        octal += trimmed[++index];
+      }
+      octets.push(Number.parseInt(octal, 8));
+      continue;
+    }
+    flushOctets();
+    output += {
+      a: '\x07',
+      b: '\b',
+      f: '\f',
+      n: '\n',
+      r: '\r',
+      t: '\t',
+      v: '\v',
+      '"': '"',
+      '\\': '\\',
+    }[escaped] ?? escaped;
+  }
+  return null;
+}
+
+function patchHeaderPath(value, gitPrefix = null) {
+  if (typeof value !== 'string') return null;
+  const token = value.trimStart().startsWith('"')
+    ? value.trimStart()
+    : value.split('\t', 1)[0];
+  let decoded = decodeGitQuotedPath(token);
+  if (decoded == null) return null;
+  if (gitPrefix && decoded.startsWith(gitPrefix)) decoded = decoded.slice(gitPrefix.length);
+  return decoded;
+}
+
+function gitDiffPaths(line) {
+  const source = line.slice('diff --git '.length);
+  if (source.startsWith('"')) {
+    let escaped = false;
+    let end = -1;
+    for (let index = 1; index < source.length; index++) {
+      if (!escaped && source[index] === '"') {
+        end = index;
+        break;
+      }
+      escaped = !escaped && source[index] === '\\';
+      if (source[index] !== '\\') escaped = false;
+    }
+    if (end < 0) return null;
+    const first = source.slice(0, end + 1);
+    const second = source.slice(end + 1).trimStart();
+    const oldPath = patchHeaderPath(first, 'a/');
+    const newPath = patchHeaderPath(second, 'b/');
+    return oldPath && newPath ? [oldPath, newPath] : null;
+  }
+  if (!source.startsWith('a/')) return null;
+  const separators = [];
+  for (let index = source.indexOf(' b/'); index >= 0; index = source.indexOf(' b/', index + 1)) {
+    separators.push(index);
+  }
+  const samePathSeparator = separators.find((index) => (
+    source.slice(2, index) === source.slice(index + 3)
+  ));
+  if (samePathSeparator == null) return null;
+  return [
+    source.slice(2, samePathSeparator),
+    source.slice(samePathSeparator + 3),
+  ];
 }
 
 function sessionProject(session) {
@@ -191,44 +306,635 @@ export function diffLineCounts(oldValue, newValue) {
   };
 }
 
-function patchTextFrom(args) {
-  if (typeof args === 'string') return args;
+const PATCH_WRAPPER_TOOLS = new Set(['bash', 'exec', 'exec_command', 'shell']);
+const MAX_PATCH_WRAPPER_SOURCE_LENGTH = 4 * 1024 * 1024;
+const MAX_PATCH_INVOCATIONS = 1_000;
+
+function looksLikePatch(value) {
+  return typeof value === 'string' && (
+    value.includes('*** Begin Patch')
+    || value.includes('diff --git ')
+    || /^--- .+\r?\n\+\+\+ .+$/m.test(value)
+  );
+}
+
+function directPatchText(args) {
+  if (typeof args === 'string') {
+    return args.length <= MAX_PATCH_WRAPPER_SOURCE_LENGTH && looksLikePatch(args) ? args : '';
+  }
   if (!args || typeof args !== 'object') return '';
   for (const key of ['patch', 'input', 'cmd', 'command']) {
-    if (typeof args[key] === 'string' && (args[key].includes('*** Begin Patch') || args[key].includes('diff --git '))) {
-      let text = args[key];
-      // Newer Codex wrappers can carry apply_patch inside a JavaScript string.
-      if (!/^\*\*\* (?:Add|Update|Delete) File:/m.test(text)) text = decodeWrappedPatch(text);
-      return text;
-    }
+    if (
+      typeof args[key] === 'string'
+      && args[key].length <= MAX_PATCH_WRAPPER_SOURCE_LENGTH
+      && looksLikePatch(args[key])
+    ) return args[key];
   }
   return '';
 }
 
-function decodeWrappedPatch(source) {
-  const marker = source.indexOf('*** Begin Patch');
-  if (marker <= 0) return source;
-  const quote = source[marker - 1];
-  if (!['"', "'", '`'].includes(quote)) return source;
-  let end = marker;
-  while (end < source.length) {
-    end = source.indexOf(quote, end + 1);
-    if (end < 0) return source;
-    let slashes = 0;
-    for (let i = end - 1; i >= 0 && source[i] === '\\'; i--) slashes++;
-    if (slashes % 2 === 0) break;
+function executableText(source) {
+  let output = '';
+  let mode = 'code';
+  let lineComment = false;
+  let blockComment = false;
+  let regexCharacterClass = false;
+  let previousSignificant = null;
+  const templateExpressionDepths = [];
+  for (let index = 0; index < source.length; index++) {
+    const character = source[index];
+    const next = source[index + 1];
+    if (lineComment) {
+      if (character === '\n') {
+        lineComment = false;
+        output += '\n';
+      } else {
+        output += ' ';
+      }
+      continue;
+    }
+    if (blockComment) {
+      if (character === '*' && next === '/') {
+        blockComment = false;
+        output += '  ';
+        index++;
+      } else {
+        output += character === '\n' ? '\n' : ' ';
+      }
+      continue;
+    }
+    if (mode === 'single' || mode === 'double') {
+      if (character === '\\') {
+        output += ' ';
+        if (index + 1 < source.length) {
+          output += source[index + 1] === '\n' ? '\n' : ' ';
+          index++;
+        }
+      } else if (
+        (mode === 'single' && character === "'")
+        || (mode === 'double' && character === '"')
+      ) {
+        mode = 'code';
+        previousSignificant = 'value';
+        output += ' ';
+      } else {
+        output += character === '\n' ? '\n' : ' ';
+      }
+      continue;
+    }
+    if (mode === 'regex') {
+      if (character === '\\') {
+        output += ' ';
+        if (index + 1 < source.length) {
+          output += source[index + 1] === '\n' ? '\n' : ' ';
+          index++;
+        }
+      } else if (character === '[') {
+        regexCharacterClass = true;
+        output += ' ';
+      } else if (character === ']' && regexCharacterClass) {
+        regexCharacterClass = false;
+        output += ' ';
+      } else if (character === '/' && !regexCharacterClass) {
+        mode = 'code';
+        previousSignificant = 'value';
+        output += ' ';
+      } else {
+        output += character === '\n' ? '\n' : ' ';
+      }
+      continue;
+    }
+    if (mode === 'template') {
+      if (character === '\\') {
+        output += ' ';
+        if (index + 1 < source.length) {
+          output += source[index + 1] === '\n' ? '\n' : ' ';
+          index++;
+        }
+      } else if (character === '`') {
+        mode = 'code';
+        previousSignificant = 'value';
+        output += ' ';
+      } else if (character === '$' && next === '{') {
+        templateExpressionDepths.push(1);
+        mode = 'code';
+        output += '  ';
+        index++;
+      } else {
+        output += character === '\n' ? '\n' : ' ';
+      }
+      continue;
+    }
+    if (character === '/' && next === '/') {
+      lineComment = true;
+      output += '  ';
+      index++;
+    } else if (character === '/' && next === '*') {
+      blockComment = true;
+      output += '  ';
+      index++;
+    } else if (
+      character === '/'
+      && (
+        previousSignificant == null
+        || '=([{,:;!&|?+-*%^~<>'.includes(previousSignificant)
+      )
+    ) {
+      mode = 'regex';
+      regexCharacterClass = false;
+      output += ' ';
+    } else if (character === '#' && (index === 0 || /\s/.test(source[index - 1]))) {
+      lineComment = true;
+      output += ' ';
+    } else if (character === '"') {
+      mode = 'double';
+      output += ' ';
+    } else if (character === "'") {
+      mode = 'single';
+      output += ' ';
+    } else if (character === '`') {
+      mode = 'template';
+      output += ' ';
+    } else if (templateExpressionDepths.length && character === '{') {
+      templateExpressionDepths[templateExpressionDepths.length - 1]++;
+      output += character;
+    } else if (templateExpressionDepths.length && character === '}') {
+      const last = templateExpressionDepths.length - 1;
+      templateExpressionDepths[last]--;
+      if (templateExpressionDepths[last] === 0) {
+        templateExpressionDepths.pop();
+        mode = 'template';
+        output += ' ';
+      } else {
+        output += character;
+      }
+    } else {
+      output += character;
+      if (!/\s/.test(character)) previousSignificant = character;
+    }
   }
-  const encoded = source.slice(marker, end);
-  if (quote === '"') {
-    try { return JSON.parse(`"${encoded}"`); } catch { /* use tolerant decoder */ }
+  return output;
+}
+
+function hasLocalApplyPatchDeclaration(source) {
+  const code = executableText(source);
+  return /^\s*(?:(?:export\s+)?(?:async\s+)?function|def)\s+apply_patch\s*\(/m.test(code)
+    || /^\s*apply_patch\s*\([^)]*\)\s*(?:\{|:)/m.test(code)
+    || /\b(?:const|let|var)\s+apply_patch\s*=/m.test(code)
+    || /\bimport\s+[^;\n]*\bapply_patch\b/m.test(code);
+}
+
+function shellTokens(source) {
+  const tokens = [];
+  const operators = ['<<-', '<<', '&&', '||', ';', '|', '&', '\n'];
+  let index = 0;
+  while (index < source.length) {
+    if (source[index] === ' ' || source[index] === '\t' || source[index] === '\r') {
+      index++;
+      continue;
+    }
+    if (source[index] === '#') {
+      while (index < source.length && source[index] !== '\n') index++;
+      continue;
+    }
+    const operator = operators.find((candidate) => source.startsWith(candidate, index));
+    if (operator) {
+      tokens.push({ type: 'operator', value: operator, start: index, end: index + operator.length });
+      index += operator.length;
+      continue;
+    }
+
+    const start = index;
+    let value = '';
+    let quoted = false;
+    while (index < source.length) {
+      const character = source[index];
+      if (/\s/.test(character) || operators.some((candidate) => source.startsWith(candidate, index))) break;
+      if (character === "'" || character === '"' || character === '`') {
+        quoted = true;
+        const quote = character;
+        index++;
+        while (index < source.length && source[index] !== quote) {
+          if (quote !== "'" && source[index] === '\\' && index + 1 < source.length) {
+            index++;
+            if (source[index] !== '\n') value += source[index];
+            index++;
+          } else {
+            value += source[index++];
+          }
+        }
+        if (source[index] === quote) index++;
+        continue;
+      }
+      if (character === '\\' && index + 1 < source.length) {
+        index++;
+        if (source[index] !== '\n') value += source[index];
+        index++;
+        continue;
+      }
+      value += character;
+      index++;
+    }
+    if (index === start) {
+      index++;
+      continue;
+    }
+    tokens.push({ type: 'word', value, quoted, start, end: index });
   }
-  let out = '';
-  for (let i = 0; i < encoded.length; i++) {
-    if (encoded[i] !== '\\' || i === encoded.length - 1) { out += encoded[i]; continue; }
-    const next = encoded[++i];
-    out += next === 'n' ? '\n' : next === 'r' ? '\r' : next === 't' ? '\t' : next;
+  return tokens;
+}
+
+function heredocBody(source, start, delimiter, stripTabs) {
+  let cursor = start;
+  while (cursor <= source.length) {
+    const newline = source.indexOf('\n', cursor);
+    const end = newline < 0 ? source.length : newline;
+    const line = source.slice(cursor, end);
+    const candidate = stripTabs ? line.replace(/^\t+/, '') : line;
+    if (candidate === delimiter) {
+      return {
+        body: source.slice(start, cursor),
+        end: newline < 0 ? end : end + 1,
+      };
+    }
+    if (newline < 0) break;
+    cursor = newline + 1;
   }
-  return out;
+  return null;
+}
+
+function shellCommandInfo(tokens) {
+  let index = 0;
+  while (tokens[index]?.type === 'word' && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index].value)) {
+    index++;
+  }
+  let explicitCommand = false;
+  if (tokens[index]?.type === 'word' && path.posix.basename(tokens[index].value) === 'command') {
+    explicitCommand = true;
+    index++;
+  }
+  const command = tokens[index]?.type === 'word'
+    ? path.posix.basename(tokens[index].value)
+    : null;
+  return { command, commandIndex: index, explicitCommand };
+}
+
+function collectShellPatches(source, budget, depth = 0) {
+  if (depth > 4 || source.length > MAX_PATCH_WRAPPER_SOURCE_LENGTH) return;
+  const tokens = shellTokens(source);
+  let commandTokens = [];
+  let skipUntil = -1;
+  let shadowed = false;
+
+  const processCommand = (boundary) => {
+    if (!commandTokens.length) return null;
+    const info = shellCommandInfo(commandTokens);
+    const nextCommand = commandTokens[info.commandIndex + 1]?.value ?? null;
+    if (
+      !info.explicitCommand
+      && (
+        info.command === 'apply_patch()'
+        || (info.command === 'apply_patch' && nextCommand === '()')
+        || (
+          info.command === 'function'
+          && (nextCommand === 'apply_patch' || nextCommand === 'apply_patch()')
+        )
+      )
+    ) {
+      shadowed = true;
+    }
+
+    if (['bash', 'sh', 'zsh'].includes(info.command)) {
+      const optionIndex = commandTokens.findIndex((token, index) => (
+        index > info.commandIndex
+        && token.type === 'word'
+        && /^-[A-Za-z]*c[A-Za-z]*$/.test(token.value)
+      ));
+      const script = optionIndex >= 0 ? commandTokens[optionIndex + 1] : null;
+      if (script?.type === 'word') collectShellPatches(script.value, budget, depth + 1);
+    }
+
+    const heredocIndex = commandTokens.findIndex((token) => (
+      token.type === 'operator' && (token.value === '<<' || token.value === '<<-')
+    ));
+    if (heredocIndex < 0 || boundary?.value !== '\n') return null;
+    const delimiter = commandTokens[heredocIndex + 1];
+    if (delimiter?.type !== 'word' || !delimiter.value) return null;
+    const body = heredocBody(
+      source,
+      boundary.end,
+      delimiter.value,
+      commandTokens[heredocIndex].value === '<<-',
+    );
+    if (!body) return null;
+    if (
+      info.command === 'apply_patch'
+      && (!shadowed || info.explicitCommand)
+      && looksLikePatch(body.body)
+    ) {
+      budget.add(body.body);
+    }
+    return body.end;
+  };
+
+  for (const token of tokens) {
+    if (token.start < skipUntil) continue;
+    if (
+      token.type === 'operator'
+      && ['\n', ';', '&&', '||', '|', '&'].includes(token.value)
+    ) {
+      const nextSkip = processCommand(token);
+      commandTokens = [];
+      if (nextSkip != null) skipUntil = nextSkip;
+    } else {
+      commandTokens.push(token);
+    }
+  }
+  processCommand(null);
+}
+
+function decodeStaticString(source, start, resolve, depth = 0) {
+  const quote = source[start];
+  if (!['"', "'", '`'].includes(quote) || depth > 16) return null;
+  let output = '';
+  for (let index = start + 1; index < source.length; index++) {
+    const character = source[index];
+    if (character === quote) return { value: output, end: index + 1 };
+    if (quote === '`' && character === '$' && source[index + 1] === '{') {
+      const expressionEnd = source.indexOf('}', index + 2);
+      if (expressionEnd < 0) return null;
+      const expression = source.slice(index + 2, expressionEnd).trim();
+      if (!/^[A-Za-z_$][\w$]*$/.test(expression)) return null;
+      const value = resolve(expression, start, depth + 1);
+      if (value == null) return null;
+      output += value;
+      index = expressionEnd;
+      continue;
+    }
+    if (character !== '\\' || index === source.length - 1) {
+      output += character;
+      continue;
+    }
+    const escaped = source[++index];
+    if (escaped === '\n') continue;
+    if (escaped === 'x' && /^[0-9a-f]{2}$/i.test(source.slice(index + 1, index + 3))) {
+      output += String.fromCodePoint(Number.parseInt(source.slice(index + 1, index + 3), 16));
+      index += 2;
+      continue;
+    }
+    if (escaped === 'u') {
+      const braced = /^\{([0-9a-f]{1,6})\}/i.exec(source.slice(index + 1));
+      if (braced) {
+        const point = Number.parseInt(braced[1], 16);
+        if (point > 0x10ffff) return null;
+        output += String.fromCodePoint(point);
+        index += braced[0].length;
+        continue;
+      }
+      const digits = source.slice(index + 1, index + 5);
+      if (/^[0-9a-f]{4}$/i.test(digits)) {
+        output += String.fromCodePoint(Number.parseInt(digits, 16));
+        index += 4;
+        continue;
+      }
+    }
+    output += {
+      n: '\n',
+      r: '\r',
+      t: '\t',
+      b: '\b',
+      f: '\f',
+      v: '\v',
+      '0': '\0',
+      '\\': '\\',
+      '"': '"',
+      "'": "'",
+      '`': '`',
+      '$': '$',
+    }[escaped] ?? escaped;
+  }
+  return null;
+}
+
+function lexicalScopes(code) {
+  const root = {
+    start: 0,
+    end: code.length,
+    parent: null,
+  };
+  const scopes = [root];
+  const stack = [root];
+  for (let index = 0; index < code.length; index++) {
+    if (code[index] === '{') {
+      const scope = {
+        start: index,
+        end: code.length,
+        parent: stack.at(-1),
+      };
+      scopes.push(scope);
+      stack.push(scope);
+    } else if (code[index] === '}' && stack.length > 1) {
+      stack.pop().end = index + 1;
+    }
+  }
+  return scopes;
+}
+
+function scopeAt(scopes, position) {
+  let low = 0;
+  let high = scopes.length - 1;
+  let found = scopes[0];
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (scopes[middle].start <= position) {
+      found = scopes[middle];
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  while (found.parent && position >= found.end) found = found.parent;
+  return found;
+}
+
+function bindingEntryBefore(bindings, identifier, before) {
+  const entries = bindings.get(identifier);
+  if (!entries?.length) return null;
+  let low = 0;
+  let high = entries.length - 1;
+  let foundIndex = -1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (entries[middle].at < before) {
+      foundIndex = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  for (let index = foundIndex; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry.scope.start <= before && before < entry.scope.end) return entry;
+  }
+  return null;
+}
+
+function bindingBefore(bindings, identifier, before) {
+  return bindingEntryBefore(bindings, identifier, before)?.value ?? null;
+}
+
+function staticAssignments(source, code) {
+  const bindings = new Map();
+  const scopes = lexicalScopes(code);
+  const resolve = (identifier, before) => bindingBefore(bindings, identifier, before);
+  const candidates = [];
+  const declarationEquals = new Set();
+  const declaration = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g;
+  let match;
+  while ((match = declaration.exec(code))) {
+    const equalsAt = match.index + match[0].lastIndexOf('=');
+    declarationEquals.add(equalsAt);
+    candidates.push({
+      at: match.index,
+      identifier: match[1],
+      start: equalsAt + 1,
+      declaration: true,
+    });
+  }
+  const assignment = /(?<![\w$.])([A-Za-z_$][\w$]*)\s*=(?!=|>)/g;
+  while ((match = assignment.exec(code))) {
+    const equalsAt = match.index + match[0].lastIndexOf('=');
+    if (declarationEquals.has(equalsAt)) continue;
+    let previous = match.index - 1;
+    while (previous >= 0 && /[ \t\r]/.test(code[previous])) previous--;
+    candidates.push({
+      at: match.index,
+      identifier: match[1],
+      start: equalsAt + 1,
+      declaration: false,
+      statementBoundary: previous < 0 || [';', '\n', '{', '}'].includes(code[previous]),
+    });
+  }
+  const compoundAssignment = /(?<![\w$.])([A-Za-z_$][\w$]*)\s*(?:\|\|=|&&=|\?\?=|[+\-*/%&|^]=|\+\+|--)/g;
+  while ((match = compoundAssignment.exec(code))) {
+    candidates.push({
+      at: match.index,
+      identifier: match[1],
+      start: match.index + match[0].length,
+      declaration: false,
+      statementBoundary: false,
+    });
+  }
+  candidates.sort((left, right) => left.at - right.at);
+
+  for (const candidate of candidates) {
+    const currentScope = scopeAt(scopes, candidate.at);
+    const prior = bindingEntryBefore(bindings, candidate.identifier, candidate.at);
+    const ownerScope = candidate.declaration
+      ? currentScope
+      : prior?.scope ?? currentScope;
+    const canResolve = candidate.declaration || (
+      candidate.statementBoundary
+      && (!prior || currentScope === prior.scope)
+    );
+    let start = candidate.start;
+    while (/[ \t\r]/.test(source[start] ?? '')) start++;
+    let value = null;
+    let end = start;
+    if (canResolve && ['"', "'", '`'].includes(source[start])) {
+      const decoded = decodeStaticString(source, start, resolve);
+      if (decoded) {
+        value = decoded.value;
+        end = decoded.end;
+      }
+    } else if (canResolve) {
+      const alias = /^[A-Za-z_$][\w$]*/.exec(source.slice(start))?.[0];
+      if (alias) {
+        value = resolve(alias, start);
+        end = start + alias.length;
+      }
+    }
+    while (/[ \t\r]/.test(code[end] ?? '')) end++;
+    if (![';', '\n', undefined].includes(code[end])) value = null;
+    const entries = bindings.get(candidate.identifier) ?? [];
+    entries.push({
+      at: candidate.at,
+      value,
+      scope: ownerScope,
+    });
+    bindings.set(candidate.identifier, entries);
+  }
+  return bindings;
+}
+
+function staticInvocationArgument(source, code, openParen, bindings) {
+  const resolve = (identifier, before) => bindingBefore(bindings, identifier, before);
+  let start = openParen + 1;
+  while (/\s/.test(source[start] ?? '')) start++;
+  let value = null;
+  let end = start;
+  if (['"', "'", '`'].includes(source[start])) {
+    const decoded = decodeStaticString(source, start, resolve);
+    if (decoded) {
+      value = decoded.value;
+      end = decoded.end;
+    }
+  } else {
+    const identifier = /^[A-Za-z_$][\w$]*/.exec(source.slice(start))?.[0];
+    if (identifier) {
+      value = resolve(identifier, start);
+      end = start + identifier.length;
+    }
+  }
+  while (/\s/.test(code[end] ?? '')) end++;
+  return value != null && code[end] === ')' ? value : null;
+}
+
+function patchBudget() {
+  const patches = [];
+  let bytes = 0;
+  return {
+    patches,
+    add(patch) {
+      if (
+        patches.length >= MAX_PATCH_INVOCATIONS
+        || typeof patch !== 'string'
+        || bytes + patch.length > MAX_PATCH_WRAPPER_SOURCE_LENGTH
+      ) return false;
+      patches.push(patch);
+      bytes += patch.length;
+      return true;
+    },
+  };
+}
+
+function collectJavaScriptPatches(source, budget) {
+  const code = executableText(source);
+  const bindings = staticAssignments(source, code);
+  const shadowed = hasLocalApplyPatchDeclaration(source);
+  const invocation = /(?<![\w$.])tools\.apply_patch\s*\(|(?<![\w$.])apply_patch\s*\(/g;
+  let count = 0;
+  let match;
+  while ((match = invocation.exec(code))) {
+    if (++count > MAX_PATCH_INVOCATIONS) break;
+    const qualified = match[0].startsWith('tools.');
+    if (!qualified && shadowed) continue;
+    const openParen = code.indexOf('(', match.index);
+    const patch = staticInvocationArgument(source, code, openParen, bindings);
+    if (looksLikePatch(patch)) budget.add(patch);
+  }
+}
+
+function wrappedPatchTexts(name, args) {
+  if (!args || typeof args !== 'object') return [];
+  const budget = patchBudget();
+  for (const field of ['input', 'cmd', 'command']) {
+    const source = args[field];
+    if (typeof source !== 'string' || source.length > MAX_PATCH_WRAPPER_SOURCE_LENGTH) continue;
+    if (name === 'exec' && field === 'input') collectJavaScriptPatches(source, budget);
+    else collectShellPatches(source, budget);
+  }
+  return budget.patches;
 }
 
 /** Parse Codex apply_patch and ordinary unified diff bodies into per-file deltas. */
@@ -236,8 +942,15 @@ export function parsePatch(patch) {
   if (typeof patch !== 'string' || !patch) return [];
   const records = new Map();
   let current = null;
-  const get = (p, operation = 'update') => {
-    p = cleanFilePath(p);
+  let customFile = false;
+  let inHunk = false;
+  let oldLinesRemaining = null;
+  let newLinesRemaining = null;
+  let pendingOldPath = null;
+  let pendingDiffPaths = null;
+  let pendingDiffDelete = false;
+  const get = (p, operation = 'update', gitPath = false) => {
+    p = cleanFilePath(p, null, { preserveBackslashes: gitPath });
     if (!p) return null;
     if (!records.has(p)) records.set(p, {
       path: p,
@@ -245,12 +958,27 @@ export function parsePatch(patch) {
       deletions: 0,
       ...(operation === 'delete' ? { estimated: true } : {}),
     });
-    return records.get(p);
+    const record = records.get(p);
+    if (gitPath && !record[GIT_PATCH_PATH]) {
+      Object.defineProperty(record, GIT_PATCH_PATH, { value: true });
+    }
+    if (operation === 'delete') record.estimated = true;
+    return record;
   };
 
   for (const line of patch.replace(/\r\n/g, '\n').split('\n')) {
     let m = /^\*\*\* (Add|Update|Delete) File: (.+)$/.exec(line);
-    if (m) { current = get(m[2], m[1].toLowerCase()); continue; }
+    if (m) {
+      current = get(m[2], m[1].toLowerCase());
+      customFile = true;
+      inHunk = false;
+      oldLinesRemaining = null;
+      newLinesRemaining = null;
+      pendingOldPath = null;
+      pendingDiffPaths = null;
+      pendingDiffDelete = false;
+      continue;
+    }
     m = /^\*\*\* Move to: (.+)$/.exec(line);
     if (m) {
       const targetPath = cleanFilePath(m[1]);
@@ -263,17 +991,105 @@ export function parsePatch(patch) {
       }
       continue;
     }
-    m = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
-    if (m) { current = get(m[2]); continue; }
-    m = /^\+\+\+ (?:b\/)?(.+)$/.exec(line);
-    if (m && m[1] !== '/dev/null') { current = get(m[1]); continue; }
-    if (!current || /^\+\+\+|^---/.test(line)) continue;
-    if (line.startsWith('+')) current.additions++;
-    else if (line.startsWith('-')) current.deletions++;
+    const diffPaths = line.startsWith('diff --git ') ? gitDiffPaths(line) : null;
+    if (line.startsWith('diff --git ')) {
+      pendingDiffPaths = diffPaths;
+      pendingDiffDelete = false;
+      current = null;
+      customFile = false;
+      inHunk = false;
+      oldLinesRemaining = null;
+      newLinesRemaining = null;
+      pendingOldPath = null;
+      continue;
+    }
+    if (!inHunk && /^deleted file mode \d+$/.test(line)) {
+      pendingDiffDelete = true;
+      if (!current && pendingDiffPaths) current = get(pendingDiffPaths[0], 'delete', true);
+      if (current) current.estimated = true;
+      continue;
+    }
+    m = /^rename from (.+)$/.exec(line);
+    if (!inHunk && m) {
+      pendingOldPath = patchHeaderPath(m[1]);
+      continue;
+    }
+    m = /^rename to (.+)$/.exec(line);
+    if (!inHunk && m) {
+      current = get(patchHeaderPath(m[1]), 'update', true);
+      pendingOldPath = null;
+      pendingDiffPaths = null;
+      continue;
+    }
+    m = /^Binary files (.+) and \/dev\/null differ$/.exec(line);
+    if (!inHunk && m) {
+      current ??= get(patchHeaderPath(m[1], 'a/'), 'delete', true);
+      if (current) current.estimated = true;
+      continue;
+    }
+    if (!inHunk && (line === 'GIT binary patch' || /^Binary files .+ differ$/.test(line))) {
+      current ??= pendingDiffPaths
+        ? get(
+          pendingDiffDelete ? pendingDiffPaths[0] : pendingDiffPaths[1],
+          pendingDiffDelete ? 'delete' : 'update',
+          true,
+        )
+        : null;
+      if (current) current.estimated = true;
+      continue;
+    }
+    if (!inHunk) {
+      m = /^--- (.+)$/.exec(line);
+      if (m) {
+        pendingOldPath = patchHeaderPath(m[1], 'a/');
+        continue;
+      }
+      m = /^\+\+\+ (.+)$/.exec(line);
+      if (m && pendingOldPath != null) {
+        const nextPath = patchHeaderPath(m[1], 'b/');
+        current = nextPath === '/dev/null'
+          ? get(pendingOldPath, 'delete', true)
+          : get(nextPath, 'update', true);
+        pendingOldPath = null;
+        pendingDiffPaths = null;
+        continue;
+      }
+    }
+    const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(line);
+    if (hunk || /^@@(?:\s|$)/.test(line)) {
+      inHunk = true;
+      oldLinesRemaining = hunk ? Number(hunk[1] ?? 1) : null;
+      newLinesRemaining = hunk ? Number(hunk[2] ?? 1) : null;
+      pendingOldPath = null;
+      continue;
+    }
+    if (!current || (!customFile && !inHunk)) continue;
+    if (line.startsWith('+')) {
+      current.additions++;
+      if (newLinesRemaining != null) newLinesRemaining--;
+    } else if (line.startsWith('-')) {
+      current.deletions++;
+      if (oldLinesRemaining != null) oldLinesRemaining--;
+    } else if (line.startsWith(' ')) {
+      if (oldLinesRemaining != null) oldLinesRemaining--;
+      if (newLinesRemaining != null) newLinesRemaining--;
+    }
+    if (
+      !customFile
+      && oldLinesRemaining != null
+      && newLinesRemaining != null
+      && oldLinesRemaining <= 0
+      && newLinesRemaining <= 0
+    ) {
+      inHunk = false;
+      oldLinesRemaining = null;
+      newLinesRemaining = null;
+    }
   }
   return [...records.values()].map((record) => {
     if (record.deletions > 0 && record.estimated) {
       const { estimated: _estimated, ...exact } = record;
+      if (record[GIT_PATCH_PATH]) Object.defineProperty(exact, GIT_PATCH_PATH, { value: true });
       return exact;
     }
     return record;
@@ -305,12 +1121,20 @@ export function extractEditOperations(ev, cwd = null) {
   if (ev?.kind !== 'tool') return [];
   const name = String(ev.tool?.name ?? '').toLowerCase();
   const args = ev.tool?.args ?? {};
-  const patch = patchTextFrom(args);
-  if (patch) {
-    return parsePatch(patch).map((operation) => ({
-      ...operation,
-      path: cleanFilePath(operation.path, cwd),
-    })).filter((operation) => operation.path);
+  const patches = name === 'apply_patch'
+    ? [directPatchText(args)].filter(Boolean)
+    : PATCH_WRAPPER_TOOLS.has(name)
+      ? wrappedPatchTexts(name, args)
+      : [];
+  if (patches.length) {
+    return patches.flatMap((patch) => (
+      parsePatch(patch).map((operation) => ({
+        ...operation,
+        path: cleanFilePath(operation.path, cwd, {
+          preserveBackslashes: operation[GIT_PATCH_PATH] === true,
+        }),
+      })).filter((operation) => operation.path)
+    ));
   }
   if (!EDIT_TOOLS.has(name)) return [];
 
@@ -468,8 +1292,12 @@ export function validatePricing(pricing) {
         issues.push(`${prefix}.${field} must be a non-negative number`);
       }
     }
-    if (!Number.isFinite(rate.input) || !Number.isFinite(rate.output)) {
-      issues.push(`${prefix} requires numeric input and output rates`);
+    if (
+      !Number.isFinite(rate.input)
+      || !Number.isFinite(rate.output)
+      || !Number.isFinite(rate.cacheRead)
+    ) {
+      issues.push(`${prefix} requires numeric input, output, and cacheRead rates`);
     }
     const interval = effectiveInterval(rate, pricing);
     if (interval && interval.from < interval.to && (rate.source == null || typeof rate.source === 'string')) {
@@ -569,7 +1397,7 @@ function priceUsageEntry(entry, source, pricing, explicitProvider = null) {
   }
   const total = (
     freshInput * (rate.input || 0)
-    + cacheRead * (rate.cacheRead ?? rate.input ?? 0)
+    + cacheRead * (rate.cacheRead ?? 0)
     + cacheWriteUntiered * (rate.cacheWrite ?? rate.cacheWrite5m ?? rate.input ?? 0)
     + cacheWrite5m * (rate.cacheWrite5m ?? rate.cacheWrite ?? rate.input ?? 0)
     + cacheWrite1h * (rate.cacheWrite1h ?? rate.cacheWrite ?? rate.input ?? 0)
@@ -577,7 +1405,7 @@ function priceUsageEntry(entry, source, pricing, explicitProvider = null) {
   ) / 1_000_000;
   return {
     ...entry,
-    total,
+    total: Number.isFinite(total) ? total : null,
     rate: publicRate(rate, pricing),
     billableTokens,
     freshInput,
@@ -589,11 +1417,15 @@ function priceUsageEntry(entry, source, pricing, explicitProvider = null) {
   };
 }
 
-export function priceSession(session, pricing) {
-  const usageEntries = Array.isArray(session.usage) && session.usage.length
-    ? session.usage
+export function priceSession(session, pricing, {
+  maximumTimestamp = Infinity,
+  fallbackTimestamp = session.startedAt,
+} = {}) {
+  const hasUsageEntries = Array.isArray(session.usage) && session.usage.length;
+  const usageEntries = hasUsageEntries
+    ? session.usage.filter((entry) => !timestampIsAfter(entry?.ts, maximumTimestamp))
     : [{
-      ts: session.startedAt,
+      ts: timestampIsAfter(fallbackTimestamp, maximumTimestamp) ? null : fallbackTimestamp,
       model: session.model,
       input: session.stats?.tokensIn ?? 0,
       output: session.stats?.tokensOut ?? 0,
@@ -608,7 +1440,7 @@ export function priceSession(session, pricing) {
     pricing,
     inferProvider(null, session.source, session.provider),
   ));
-  const pricedEntries = breakdown.filter((entry) => entry.total != null);
+  const pricedEntries = breakdown.filter((entry) => Number.isFinite(entry.total));
   const rates = [...new Map(pricedEntries.map((entry) => [entry.rate.id, entry.rate])).values()];
   const billableTokens = breakdown.reduce((sum, entry) => tokenSum(sum, entry.billableTokens), 0);
   const pricedTokens = pricedEntries.reduce((sum, entry) => tokenSum(sum, entry.billableTokens), 0);
@@ -635,11 +1467,49 @@ const median = (values) => {
   return nums.length % 2 ? nums[mid] : (nums[mid - 1] + nums[mid]) / 2;
 };
 
-export function sessionIntelligence(session, pricing) {
+export function sessionIntelligence(session, pricing, {
+  now = Date.now(),
+  maximumTimestamp = now + FUTURE_TIMESTAMP_TOLERANCE_MS,
+} = {}) {
   const files = new Map();
   const edits = [];
   const toolLatencies = [];
-  const users = session.events.filter((e) => e.kind === 'user');
+  const events = [];
+  let futureEventsOmitted = 0;
+  let startedMs = null;
+  let endedMs = null;
+  const admitTime = (value) => {
+    const parsed = analyticsTimestampMs(value);
+    if (parsed == null || parsed > maximumTimestamp) return;
+    if (startedMs == null || parsed < startedMs) startedMs = parsed;
+    if (endedMs == null || parsed > endedMs) endedMs = parsed;
+  };
+  admitTime(session.startedAt);
+  admitTime(session.endedAt);
+  for (const rawEvent of session.events) {
+    if (timestampIsAfter(rawEvent.ts, maximumTimestamp)) {
+      futureEventsOmitted++;
+      continue;
+    }
+    admitTime(rawEvent.ts);
+    if (rawEvent.kind === 'tool' && timestampIsAfter(rawEvent.tool?.resultTs, maximumTimestamp)) {
+      futureEventsOmitted++;
+      events.push({
+        ...rawEvent,
+        tool: {
+          ...rawEvent.tool,
+          result: null,
+          resultTs: null,
+          isError: false,
+          confirmed: false,
+        },
+      });
+    } else {
+      if (rawEvent.kind === 'tool') admitTime(rawEvent.tool?.resultTs);
+      events.push(rawEvent);
+    }
+  }
+  const users = events.filter((e) => e.kind === 'user');
   let toolCalls = 0;
   let toolErrors = 0;
   let attemptedEditOperations = 0;
@@ -648,7 +1518,7 @@ export function sessionIntelligence(session, pricing) {
   let unconfirmedEditOperations = 0;
   let firstEditAt = null;
 
-  for (const ev of session.events) {
+  for (const ev of events) {
     if (ev.kind !== 'tool') continue;
     toolCalls++;
     if (ev.tool.isError) toolErrors++;
@@ -688,12 +1558,49 @@ export function sessionIntelligence(session, pricing) {
     const ms = Date.parse(firstEditAt) - Date.parse(firstUserAt);
     if (ms >= 0 && ms < 86_400_000) timeToFirstEditMs = ms;
   }
-  const last = [...session.events].reverse().find((e) => e.kind === 'user' || e.kind === 'assistant' || e.kind === 'tool');
-  const isLive = session.endedAt && Date.now() - Date.parse(session.endedAt) < 5 * 60_000;
+  let last = null;
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index];
+    if (event.kind === 'user' || event.kind === 'assistant' || event.kind === 'tool') {
+      last = event;
+      break;
+    }
+  }
+  const liveAge = endedMs == null ? null : now - endedMs;
+  const isLive = liveAge != null
+    && liveAge >= -FUTURE_TIMESTAMP_TOLERANCE_MS
+    && liveAge < FUTURE_TIMESTAMP_TOLERANCE_MS;
   const abandoned = Boolean(users.length && last?.kind !== 'assistant' && !isLive);
   const reworkLoops = [...files.values()].reduce((n, f) => n + Math.max(0, f.edits - 1), 0);
-  const cost = priceSession(session, pricing);
+  const cost = priceSession(session, pricing, {
+    maximumTimestamp,
+    fallbackTimestamp: startedMs == null ? null : new Date(startedMs).toISOString(),
+  });
+  const eventToolCounts = Object.fromEntries(
+    [...events
+      .filter((event) => event.kind === 'tool')
+      .reduce((counts, event) => {
+        counts.set(event.tool.name, (counts.get(event.tool.name) ?? 0) + 1);
+        return counts;
+      }, new Map())],
+  );
+  const observed = {
+    tokensIn: cost.breakdown.reduce((sum, entry) => tokenSum(sum, entry.input), 0),
+    tokensOut: cost.breakdown.reduce((sum, entry) => tokenSum(sum, entry.output), 0),
+    tokensCacheRead: cost.breakdown.reduce((sum, entry) => tokenSum(sum, entry.cacheRead), 0),
+    tokensCacheWrite: cost.breakdown.reduce((sum, entry) => tokenSum(sum, entry.cacheWrite), 0),
+    messages: events.filter((event) => event.kind === 'user' || event.kind === 'assistant').length,
+    errors: toolErrors,
+    toolCounts: futureEventsOmitted
+      ? eventToolCounts
+      : session.stats?.toolCounts ?? eventToolCounts,
+  };
   return {
+    events,
+    futureEventsOmitted,
+    startedMs,
+    endedMs,
+    observed,
     edits,
     files: [...files.values()],
     editOperations: edits.length,
@@ -801,7 +1708,15 @@ function riskLevel(score) {
   return score >= 65 ? 'high' : score >= 30 ? 'watch' : 'low';
 }
 
-export function buildStats(sessions, { days = 30, pricing = null, analysisByKey = null } = {}) {
+export function buildStats(
+  sessions,
+  {
+    days = 30,
+    pricing = null,
+    analysisByKey = null,
+    now = Date.now(),
+  } = {},
+) {
   const perDay = new Map();
   const day = (k) => {
     if (!k) return null;
@@ -825,18 +1740,18 @@ export function buildStats(sessions, { days = 30, pricing = null, analysisByKey 
   let longest = null;
 
   for (const session of sessions) {
-    const intel = analysisByKey?.get(session.key) ?? sessionIntelligence(session, pricing);
+    const intel = analysisByKey?.get(session.key) ?? sessionIntelligence(session, pricing, { now });
     const source = sources.get(session.source) ?? sourceAggregate(session.source);
     sources.set(session.source, source);
     source.sessions++;
     source.edits += intel.editOperations;
     source.changedLines += intel.changedLines;
-    source.outputTokens = tokenSum(source.outputTokens, session.stats.tokensOut);
-    source.inputTokens = tokenSum(source.inputTokens, session.stats.tokensIn);
-    source.cacheRead = tokenSum(source.cacheRead, session.stats.tokensCacheRead);
+    source.outputTokens = tokenSum(source.outputTokens, intel.observed.tokensOut);
+    source.inputTokens = tokenSum(source.inputTokens, intel.observed.tokensIn);
+    source.cacheRead = tokenSum(source.cacheRead, intel.observed.tokensCacheRead);
     source.toolCalls += intel.toolCalls;
     source.toolErrors += intel.toolErrors;
-    source.toolLatencies.push(...intel.toolLatencies);
+    for (const latency of intel.toolLatencies) source.toolLatencies.push(latency);
     source.corrections += intel.corrections;
     source.reworkLoops += intel.reworkLoops;
     source.abandoned += Number(intel.abandoned);
@@ -870,12 +1785,12 @@ export function buildStats(sessions, { days = 30, pricing = null, analysisByKey 
     }
 
     totals.spawns += session.children.length;
-    totals.tokensIn = tokenSum(totals.tokensIn, session.stats.tokensIn);
-    totals.tokensOut = tokenSum(totals.tokensOut, session.stats.tokensOut);
-    totals.cacheRead = tokenSum(totals.cacheRead, session.stats.tokensCacheRead);
-    totals.cacheWrite = tokenSum(totals.cacheWrite, session.stats.tokensCacheWrite);
+    totals.tokensIn = tokenSum(totals.tokensIn, intel.observed.tokensIn);
+    totals.tokensOut = tokenSum(totals.tokensOut, intel.observed.tokensOut);
+    totals.cacheRead = tokenSum(totals.cacheRead, intel.observed.tokensCacheRead);
+    totals.cacheWrite = tokenSum(totals.cacheWrite, intel.observed.tokensCacheWrite);
     totals.errors += intel.toolErrors;
-    totals.messages += session.stats.messages || 0;
+    totals.messages += intel.observed.messages;
     totals.edits += intel.editOperations;
     totals.editCalls += intel.confirmedEditCalls;
     totals.attemptedEdits += intel.attemptedEditOperations;
@@ -895,18 +1810,27 @@ export function buildStats(sessions, { days = 30, pricing = null, analysisByKey 
         sessions: 0,
         apiCost: 0,
         pricedSessions: 0,
-        rate: pricedForModel[0]?.rate ?? null,
+        rates: [],
       };
       model.sessions++;
       if (pricedForModel.length) {
         model.apiCost += pricedForModel.reduce((sum, entry) => sum + entry.total, 0);
         model.pricedSessions++;
-        model.rate ??= pricedForModel[0].rate;
+        for (const entry of pricedForModel) {
+          const rateKey = [
+            entry.rate.id,
+            entry.rate.effectiveFrom ?? '',
+            entry.rate.effectiveTo ?? '',
+          ].join('\0');
+          if (!model.rates.some((rate) => rate.key === rateKey)) {
+            model.rates.push({ key: rateKey, value: entry.rate });
+          }
+        }
       }
       models.set(modelKey, model);
     }
 
-    const startedDay = day(dayKey(session.startedAt));
+    const startedDay = day(intel.startedMs == null ? null : dayKey(new Date(intel.startedMs)));
     if (startedDay) {
       startedDay.sessions++;
     }
@@ -919,8 +1843,8 @@ export function buildStats(sessions, { days = 30, pricing = null, analysisByKey 
       usageDay.tokensCacheWrite = tokenSum(usageDay.tokensCacheWrite, usage.cacheWrite);
       if (usage.total != null) usageDay.apiCost += usage.total;
     }
-    if (session.startedAt && session.endedAt) {
-      const ms = Date.parse(session.endedAt) - Date.parse(session.startedAt);
+    if (intel.startedMs != null && intel.endedMs != null) {
+      const ms = intel.endedMs - intel.startedMs;
       if (ms > 0 && ms < 86_400_000 && (!longest || ms > longest.ms)) longest = { ms, label: session.label, id: session.id };
     }
 
@@ -964,7 +1888,7 @@ export function buildStats(sessions, { days = 30, pricing = null, analysisByKey 
       pricedTokens: intel.cost.pricedTokens,
     });
 
-    for (const ev of session.events) {
+    for (const ev of intel.events) {
       if (!ev.ts) continue;
       const t = new Date(ev.ts);
       if (!Number.isNaN(t.getTime()) && (ev.kind === 'tool' || ev.kind === 'assistant')) punch[t.getDay()][t.getHours()]++;
@@ -989,7 +1913,7 @@ export function buildStats(sessions, { days = 30, pricing = null, analysisByKey 
     const score = Math.round(Math.min(100,
       35 * Math.min(1, sessionsTouched / 4) + 25 * Math.min(1, f.edits / 8)
       + 25 * Math.min(1, churn / 6) + 15 * Math.min(1, (f.additions + f.deletions) / 500)));
-    const directory = path.posix.dirname(f.path.replaceAll('\\', '/'));
+    const directory = path.posix.dirname(f.path);
     const directoryKey = `${f.project}\0${directory}`;
     const dir = directories.get(directoryKey) ?? {
       project: f.project,
@@ -1020,13 +1944,14 @@ export function buildStats(sessions, { days = 30, pricing = null, analysisByKey 
   })).sort((a, b) => b.edits - a.edits || b.changedLines - a.changedLines);
 
   const keys = [...perDay.keys()].sort();
-  const today = new Date();
+  const today = new Date(now);
+  if (Number.isNaN(today.getTime())) throw new Error('statistics require a valid current date');
   const series = [];
   const emptyDay = (date) => ({ date, toolCalls: 0, tokensIn: 0, tokensOut: 0, tokensCache: 0, tokensCacheWrite: 0, sessions: 0, errors: 0, additions: 0, deletions: 0, edits: 0, apiCost: 0 });
   const maxAllSeriesDays = 730;
   if (Number.isFinite(days)) {
-    const start = new Date(today.getTime() - (Math.max(1, days) - 1) * 86_400_000);
-    for (let d = new Date(start.getFullYear(), start.getMonth(), start.getDate()); d <= today; d.setDate(d.getDate() + 1)) {
+    const start = calendarWindowStart(today, days);
+    for (let d = new Date(start); d <= today; d.setDate(d.getDate() + 1)) {
       const k = dayKey(d);
       series.push(perDay.get(k) || emptyDay(k));
     }
@@ -1077,6 +2002,15 @@ export function buildStats(sessions, { days = 30, pricing = null, analysisByKey 
     timeToFirstEditSamples: sessionRows.filter((s) => s.timeToFirstEditMs != null).length,
     medianTimeToFirstEditMs: median(sessionRows.map((s) => s.timeToFirstEditMs)),
   };
+  const modelRows = [...models.values()].map(({ rates: rateEntries, ...model }) => {
+    const rates = rateEntries.map((entry) => entry.value);
+    return {
+      ...model,
+      rate: rates.length === 1 ? rates[0] : null,
+      rates,
+      rateMode: rates.length > 1 ? 'mixed' : rates.length === 1 ? 'single' : 'unpriced',
+    };
+  });
 
   return {
     window: {
@@ -1084,7 +2018,7 @@ export function buildStats(sessions, { days = 30, pricing = null, analysisByKey 
       to: windowTo,
       days: Number.isFinite(days) ? days : null,
       spanDays,
-      mode: 'complete sessions whose latest valid event is inside the window',
+      mode: 'complete sessions whose latest valid activity is inside the window',
       seriesMode: Number.isFinite(days) ? 'calendar-days' : 'active-days',
       seriesTruncated: !Number.isFinite(days) && keys.length > maxAllSeriesDays,
       omittedActiveDays: !Number.isFinite(days) ? Math.max(0, keys.length - maxAllSeriesDays) : 0,
@@ -1093,7 +2027,7 @@ export function buildStats(sessions, { days = 30, pricing = null, analysisByKey 
     perDay: series,
     punch,
     tools: [...tools.values()].sort((a, b) => b.count - a.count),
-    models: [...models.values()].sort((a, b) => b.sessions - a.sessions),
+    models: modelRows.sort((a, b) => b.sessions - a.sessions),
     impact: { files: fileRows, directories: directoryRows, churnFiles: fileRows.filter((f) => f.sessions > 1 || f.churn > 1) },
     scoreboard: [...sources.values()].map(finalizeSource).sort((a, b) => b.sessions - a.sessions),
     providers: [...providers.values()]
@@ -1139,12 +2073,12 @@ export function sessionSummary(session, pricing, includeEvents = false, analysis
     model: session.model,
     provider: inferProvider(session.model, session.source, session.provider),
     runtime: session.runtime,
-    startedAt: session.startedAt,
-    endedAt: session.endedAt,
+    startedAt: intel.startedMs == null ? null : new Date(intel.startedMs).toISOString(),
+    endedAt: intel.endedMs == null ? null : new Date(intel.endedMs).toISOString(),
     parent: session.parent,
     children: session.children,
-    stats: session.stats,
-    eventCount: session.events.length,
+    stats: { ...session.stats, ...intel.observed },
+    eventCount: intel.events.length,
     intelligence: {
       apiCost: intel.cost.total,
       rate: intel.cost.rate,
@@ -1166,7 +2100,8 @@ export function sessionSummary(session, pricing, includeEvents = false, analysis
       timeToFirstEditMs: intel.timeToFirstEditMs,
       medianToolLatencyMs: intel.medianToolLatencyMs,
       estimatedEdits: intel.estimatedOperations,
+      futureEventsOmitted: intel.futureEventsOmitted,
     },
-    ...(includeEvents ? { events: session.events } : {}),
+    ...(includeEvents ? { events: intel.events } : {}),
   };
 }

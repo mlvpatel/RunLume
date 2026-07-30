@@ -359,7 +359,9 @@ function renderMain() {
   const t = stats.totals;
   const freshIn = Math.max(0, t.tokensIn - t.cacheRead - (t.cacheWrite || 0));
   const totalTokens = freshIn + t.tokensOut;
-  const windowLabel = stats.window.days ? `Last ${countLabel(stats.window.days, 'day')}` : 'All history';
+  const windowLabel = stats.window.days
+    ? `Sessions active in last ${countLabel(stats.window.days, 'day')}`
+    : 'All discovered sessions';
   const topModel = stats.models[0]?.name;
   const completionRate = t.sessions
     ? Math.max(0, (t.sessions - stats.workflow.abandoned) / t.sessions)
@@ -396,7 +398,7 @@ function renderMain() {
         </div>
         <div class="hero-chart">
           <div class="chart-heading">
-            <div><span class="section-kicker">Activity signal</span><h3 id="activity-title">Daily token flow</h3></div>
+            <div><span class="section-kicker">Visible calendar days</span><h3 id="activity-title">Daily token flow</h3></div>
             <div class="legend" aria-label="Chart legend">
               <span class="chip"><span class="sw" style="background:var(--ser-in)"></span>Input</span>
               <span class="chip"><span class="sw" style="background:var(--ser-out)"></span>Output</span>
@@ -507,6 +509,7 @@ function diagnosticBanner() {
   const issues = [];
   if (d.malformedLines) issues.push(`${fmtInt(d.malformedLines)} malformed JSONL line${d.malformedLines === 1 ? '' : 's'} skipped`);
   if (d.invalidRows) issues.push(`${fmtInt(d.invalidRows)} non-object transcript record${d.invalidRows === 1 ? '' : 's'} skipped`);
+  if (d.rowErrors) issues.push(`${fmtInt(d.rowErrors)} transcript record${d.rowErrors === 1 ? '' : 's'} skipped after an adapter error`);
   if (d.filesUnreadable) issues.push(`${fmtInt(d.filesUnreadable)} unreadable file${d.filesUnreadable === 1 ? '' : 's'}`);
   if (d.filesTooLarge) issues.push(`${fmtInt(d.filesTooLarge)} oversized file${d.filesTooLarge === 1 ? '' : 's'} skipped`);
   if (d.filesRejectedSymlink) issues.push(`${fmtInt(d.filesRejectedSymlink)} symbolic-link transcript${d.filesRejectedSymlink === 1 ? '' : 's'} rejected`);
@@ -520,7 +523,7 @@ function diagnosticBanner() {
   if (d.invalidSessionIds) issues.push(`${fmtInt(d.invalidSessionIds)} invalid session identifier${d.invalidSessionIds === 1 ? '' : 's'} replaced or skipped`);
   if (d.ambiguousSpawnLinks) issues.push(`${fmtInt(d.ambiguousSpawnLinks)} ambiguous spawn link${d.ambiguousSpawnLinks === 1 ? '' : 's'}`);
   if (d.cyclicSpawnLinks) issues.push(`${fmtInt(d.cyclicSpawnLinks)} cyclic spawn link${d.cyclicSpawnLinks === 1 ? '' : 's'} ignored`);
-  if (d.futureSessions) issues.push(`${fmtInt(d.futureSessions)} future-dated session${d.futureSessions === 1 ? '' : 's'} excluded`);
+  if (d.futureSessions) issues.push(`${fmtInt(d.futureSessions)} session${d.futureSessions === 1 ? '' : 's'} contained future-dated timestamps; affected data was ignored`);
   if (d.sessionsWithoutTimestamps) {
     const disposition = stats?.window?.days
       ? 'excluded'
@@ -577,7 +580,17 @@ function renderCostIntelligence() {
   const estimateLabel = cost.isPartial ? 'API cost lower bound' : 'API-equivalent cost';
   const rows = cost.bySource.filter((r) => r.pricedSessions > 0);
   const max = Math.max(0.000001, ...rows.map((r) => r.total));
-  const observedRates = stats.models.filter((m) => m.rate);
+  const observedRates = stats.models.flatMap((model) => {
+    const rates = Array.isArray(model.rates) && model.rates.length
+      ? model.rates
+      : model.rate ? [model.rate] : [];
+    return rates.map((rate) => {
+      const period = rates.length > 1
+        ? ` · ${rate.effectiveFrom || 'start'} to ${rate.effectiveTo || 'current'}`
+        : '';
+      return { name: `${model.name}${period}`, rate };
+    });
+  });
   host.innerHTML = `
     <div class="panel-title-row">
       <div><h2>API-equivalent cost and plan comparison <span class="note">· estimated at public API rates</span></h2></div>
@@ -1140,6 +1153,7 @@ function eventHtml(ev) {
   if (ev.kind === 'meta') return wrap('ev-meta', `EVENT ${when}`, `<div class="body">${esc(ev.text)}</div>`);
   if (ev.kind === 'tool') {
     const t = ev.tool;
+    const result = t.result == null ? '' : String(t.result);
     const spawn = Boolean(t.spawnTarget);
     const dur = t.resultTs && ev.ts ? fmtDur(Date.parse(t.resultTs) - Date.parse(ev.ts)) : '';
     const status = t.isError
@@ -1156,7 +1170,7 @@ function eventHtml(ev) {
           ${dur ? `<span class="dur">${dur}</span>` : ''}
         </div>
         ${args && args !== '{}' ? `<details><summary>arguments</summary><pre>${esc(args)}</pre></details>` : ''}
-        ${t.result ? `<details><summary>result: ${esc(t.result.slice(0, 120))}${t.result.length > 120 ? '…' : ''}</summary><pre>${esc(t.result)}</pre></details>` : ''}
+        ${result ? `<details><summary>result: ${esc(result.slice(0, 120))}${result.length > 120 ? '…' : ''}</summary><pre>${esc(result)}</pre></details>` : ''}
         ${spawn ? `<button class="spawn-open" data-key="${esc(t.spawnTarget)}">Open sub-agent trajectory ↳</button>` : ''}
       </div>`
     );

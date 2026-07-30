@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.2 - 2026-07-30
+
+- Corrected the documented localhost threat model, supported Node.js lines,
+  copyright attribution, and verified Claude Fable 5 and Mythos 5 pricing.
+- Isolated adapter failures to individual transcript records without allowing
+  rejected rows to mutate session state, bounded imported text depth, and made
+  deep Claude sidechain grouping near-linear and cycle-tolerant.
+- Bound patch extraction to executed arguments, rejected shell and JavaScript
+  lookalikes, decoded Git paths safely, and capped wrapper analysis work.
+- Excluded implausibly future-dated events and usage from admitted-session
+  analytics, while reporting affected sessions in diagnostics.
+- Fixed unified-diff header parsing, large latency aggregation, mixed-period
+  pricing output, non-finite cost coverage, source-scoped session lookup,
+  aggregate redaction labels, and refresh throttling.
+- Added calendar-day scan boundaries, stricter CLI and document-navigation
+  validation, collision-resistant port-specific cookie names, expanded security
+  and regression coverage, an integrity-pinned package manager, a prepublish
+  quality gate, and an explicit package manifest.
+- Added a high-severity dependency-audit gate and generated CycloneDX SBOM
+  artifact to CI.
+- Added signed GitHub release assets, SHA-256 checksums, Sigstore-backed build
+  provenance and SBOM attestations for version tags.
+- Removed README demo media from the npm package while keeping the verified
+  GitHub-hosted visuals and documentation available to readers.
+- Made the live dashboard tour reproducible with offline narration, atomic
+  H.264/AAC encoding, and an embedded English subtitle track.
+
 ## 0.3.1 - 2026-07-29
 
 - Bounded tool and model identifiers at ingestion, protected tool counters from
@@ -16,7 +43,7 @@
 - Avoided duplicate CI runs by reserving push workflows for `main` and release
   tags while pull requests retain the complete release matrix.
 - Replaced the clear-text launch URL capability with an HMAC-derived,
-  browser-specific capability in an `HttpOnly`, `SameSite=Strict` session
+  per-launch browser-session capability in an `HttpOnly`, `SameSite=Strict` session
   cookie, resolving the CodeQL findings without exposing the raw API token.
 - Increased the secondary header label contrast to keep the Firefox axe audit
   stable at the WCAG AA threshold.
