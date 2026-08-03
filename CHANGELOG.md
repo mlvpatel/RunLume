@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.3 - 2026-08-03
+
+- Routed private conduct reports through the repository's private reporting
+  form, matching the channel used by the security policy and support guide.
+- Republished the repository with a clean history ahead of the public release.
+  Earlier versions predate the public repository and carry no tags or release
+  assets; this is the first publicly tagged release.
+- Recorded release provenance and SBOM attestations on the public Sigstore
+  transparency log beginning with this version.
+
 ## 0.3.2 - 2026-07-30
 
 - Corrected the documented localhost threat model, supported Node.js lines,

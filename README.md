@@ -219,7 +219,7 @@ a GitHub release containing the exact npm tarball, CycloneDX SBOM, and
 the release package; verify them with:
 
 ```bash
-gh attestation verify runlume-v0.3.2.tgz --repo mlvpatel/RunLume
+gh attestation verify runlume-v0.3.3.tgz --repo mlvpatel/RunLume
 shasum -a 256 -c SHA256SUMS
 ```
 
