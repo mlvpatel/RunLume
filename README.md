@@ -359,8 +359,8 @@ shasum -a 256 -c SHA256SUMS
 
 | Path | Responsibility |
 |---|---|
-| `adapters.mjs` | Source discovery and transcript normalization |
-| `analytics.mjs` | Pricing, code impact, workflow, source, and provider metrics |
+| `adapters.mjs` + `adapters/` | Source discovery and transcript normalization, one module per agent CLI |
+| `analytics.mjs` + `analytics/` | Pricing, code impact, workflow, source, and provider metrics, one module per concern |
 | `server.mjs` | Bounded scanning, redacted API, authentication, and localhost server |
 | `public/` | Dependency-free dashboard interface |
 | `sample/` | Synthetic demo generator |
