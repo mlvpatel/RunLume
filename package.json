@@ -1,6 +1,6 @@
 {
   "name": "runlume",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Local-first analytics for AI coding sessions, provider cost, code impact, workflow, and timelines.",
   "type": "module",
   "files": [
