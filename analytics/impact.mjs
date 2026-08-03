@@ -2,6 +2,10 @@ import path from 'node:path';
 import {
   linesOf,
 } from './shared.mjs';
+/**
+ * Count the minimal line additions/removals for a replacement. Large blocks use
+ * a bounded fallback after stripping common prefixes/suffixes.
+ */
 export function diffLineCounts(oldValue, newValue) {
   const oldLines = linesOf(oldValue);
   const newLines = linesOf(newValue);
