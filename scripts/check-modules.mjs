@@ -27,7 +27,11 @@ for (const directory of DIRECTORIES) {
     try {
       execFileSync(process.execPath, ['--check', file], { stdio: 'pipe' });
     } catch (error) {
-      console.error(`error: syntax check failed for ${directory}/${name}\n${error.stderr}`);
+      const stderr = typeof error?.stderr === 'string'
+        ? error.stderr
+        : Buffer.isBuffer(error?.stderr) ? error.stderr.toString('utf8') : '';
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`error: syntax check failed for ${directory}/${name}\n${stderr || message}`);
       failed = true;
       continue;
     }
