@@ -263,8 +263,7 @@ function linesOf(value) {
 }
 
 /**
- * Count the minimal line additions/removals for a replacement. Large blocks use
- * a bounded fallback after stripping common prefixes/suffixes.
+ * Compute the median of a list of numeric values. Returns null for empty input.
  */
 const median = (values) => {
   const nums = values.filter(Number.isFinite).sort((a, b) => a - b);
