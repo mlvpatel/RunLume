@@ -66,7 +66,7 @@ compatibility. RunLume has no runtime dependencies and no build step.
 Run the published package directly:
 
 ```bash
-npx runlume
+npx -y runlume@0.3.3
 ```
 
 Or clone the repository, which also provides the synthetic sample:
