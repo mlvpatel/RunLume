@@ -371,6 +371,7 @@ shasum -a 256 -c SHA256SUMS
 - [Architecture and trust boundaries](https://github.com/mlvpatel/RunLume/blob/main/docs/architecture.md)
 - [CLI, imports, pricing, metrics, and limits](https://github.com/mlvpatel/RunLume/blob/main/docs/reference.md)
 - [Security policy](https://github.com/mlvpatel/RunLume/blob/main/SECURITY.md)
+- [Governance and continuity](https://github.com/mlvpatel/RunLume/blob/main/GOVERNANCE.md)
 - [Contribution guide](https://github.com/mlvpatel/RunLume/blob/main/CONTRIBUTING.md)
 - [Support](https://github.com/mlvpatel/RunLume/blob/main/.github/SUPPORT.md)
 - [Changelog](https://github.com/mlvpatel/RunLume/blob/main/CHANGELOG.md)

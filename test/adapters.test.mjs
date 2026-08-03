@@ -1183,3 +1183,238 @@ test('API log adapter is only enabled for an explicit import directory', () => {
     [API_LOG_FIXTURE],
   );
 });
+
+test('generic parser rejects malformed envelopes and unsupported roles per row', (t) => {
+  const file = fixture(t, 'generic-envelope-errors.jsonl', [
+    { type: 'session', id: 'generic-errors', timestamp: '2026-07-20T10:00:00Z' },
+    { message: 'not-an-object', timestamp: '2026-07-20T10:00:01Z' },
+    { message: { role: 'moderator', content: 'unsupported' }, timestamp: '2026-07-20T10:00:02Z' },
+    { message: { role: 'user', content: 'Still parsed' }, timestamp: '2026-07-20T10:00:03Z' },
+  ]);
+  const { sessions, diagnostics } = parseGenericAgentFile('hermes', file, 'main');
+  assert.equal(diagnostics.rowErrors, 2);
+  const users = sessions[0].events.filter((event) => event.kind === 'user');
+  assert.deepEqual(users.map((event) => event.text), ['Still parsed']);
+});
+
+test('generic parser keeps typed meta rows, thinking blocks, and result fallbacks', (t) => {
+  const file = fixture(t, 'generic-variants.jsonl', [
+    { type: 'session', id: 'generic-variants', timestamp: '2026-07-20T10:00:00Z' },
+    { type: 'compaction', timestamp: '2026-07-20T10:00:01Z' },
+    { message: { role: 'assistant', content: [
+      { type: 'thinking', thinking: 'consider the plan' },
+      { type: 'redacted_thinking', text: 'hidden reasoning' },
+      { type: 'toolCall', toolCallId: 'call-1', toolName: 'read', arguments: { path: 'a.txt' } },
+    ] }, timestamp: '2026-07-20T10:00:02Z' },
+    { message: { role: 'tool', toolCallId: 'call-1', result: 'from result field' }, timestamp: '2026-07-20T10:00:03Z' },
+    { message: { role: 'assistant', content: [
+      { type: 'tool_use', id: 'call-2', name: 'grep', input: { pattern: 'x' } },
+    ] }, timestamp: '2026-07-20T10:00:04Z' },
+    { message: { role: 'user', content: [
+      { type: 'tool_result', toolCallId: 'call-2', content: 'matches', isError: false },
+      { type: 'text', text: 'thanks' },
+    ] }, timestamp: '2026-07-20T10:00:05Z' },
+  ]);
+  const { sessions, diagnostics } = parseGenericAgentFile('hermes', file, 'main');
+  assert.equal(diagnostics.rowErrors, 0);
+  const events = sessions[0].events;
+  assert.deepEqual(
+    events.filter((event) => event.kind === 'thinking').map((event) => event.text),
+    ['consider the plan', 'hidden reasoning'],
+  );
+  assert.ok(events.some((event) => event.kind === 'meta' && event.text === 'compaction'));
+  const tools = events.filter((event) => event.kind === 'tool');
+  assert.deepEqual(tools.map((event) => event.tool.result), ['from result field', 'matches']);
+  assert.deepEqual(
+    events.filter((event) => event.kind === 'user').map((event) => event.text),
+    ['thanks'],
+  );
+});
+
+test('claude ai-title outranks summary and cyclic sidechains stay bounded', (t) => {
+  const file = fixture(t, 'claude-title-cycle.jsonl', [
+    { type: 'summary', summary: 'Summary label' },
+    { type: 'ai-title', aiTitle: 'Preferred title' },
+    { type: 'user', uuid: 'root-1', timestamp: '2026-07-20T10:00:00Z', message: { role: 'user', content: 'Main question' } },
+    { isSidechain: true, type: 'user', uuid: 'side-a', parentUuid: 'side-b', timestamp: '2026-07-20T10:00:02Z', message: { role: 'user', content: 'Sub task' } },
+    { isSidechain: true, type: 'assistant', uuid: 'side-b', parentUuid: 'side-a', timestamp: '2026-07-20T10:00:03Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Sub answer' }] } },
+  ]);
+  const { sessions } = parseClaudeCodeFile(file, 'project');
+  assert.equal(sessions.length, 2);
+  assert.equal(sessions[0].label, 'Preferred title');
+  assert.equal(sessions[1].label, 'Sub task');
+});
+
+test('gemini checkpoint $set replaces messages and maps call outcomes', (t) => {
+  const file = fixture(t, 'gemini-set.jsonl', [
+    { sessionId: 'gem-set', projectHash: 'hash', startTime: '2026-07-20T10:00:00Z', lastUpdated: '2026-07-20T10:00:09Z', kind: 'main' },
+    { $set: { summary: 'From metadata', messages: [
+      { id: 'm-1', timestamp: '2026-07-20T10:00:01Z', type: 'gemini', model: 'gemini-3.1-pro-preview', content: [{ text: 'ok' }], tokens: { input: 0, output: 0, cached: 0 }, thoughts: [{ subject: 'Plan', description: 'do it' }], toolCalls: [
+        { id: 'call-1', name: 'run_shell_command', args: {}, status: 'CANCELLED' },
+        { id: 'call-2', name: 'replace', args: {}, status: 'Success' },
+        { id: 'call-3', name: 'read_file', args: {}, result: [{ text: 'file body' }], status: 'success' },
+      ] },
+      { id: 'm-2', timestamp: '2026-07-20T10:00:02Z', type: 'error', content: [{ text: 'quota exhausted' }] },
+      { id: 'm-3', timestamp: '2026-07-20T10:00:03Z', type: 'warning', content: [{ text: 'watch out' }] },
+    ] } },
+  ]);
+  const { sessions } = parseGeminiFile(file);
+  const session = sessions[0];
+  assert.equal(session.label, 'From metadata');
+  assert.equal(session.stats.errors, 2);
+  assert.equal((session.usage ?? []).length, 0);
+  const tools = session.events.filter((event) => event.kind === 'tool');
+  assert.deepEqual(
+    tools.map((event) => [event.tool.name, event.tool.isError, event.tool.result]),
+    [['Bash', true, 'cancelled'], ['Edit', false, null], ['Read', false, 'file body']],
+  );
+  assert.equal(tools[1].tool.confirmed, true);
+  assert.ok(session.events.some((event) => event.kind === 'thinking' && event.text === 'Plan\ndo it'));
+  const meta = session.events.filter((event) => event.kind === 'meta').map((event) => event.text);
+  assert.deepEqual(meta, ['quota exhausted', 'watch out']);
+});
+
+test('gemini checkpoint rows with invalid shapes error per row and honor rewind', (t) => {
+  const file = fixture(t, 'gemini-rewind.jsonl', [
+    { sessionId: 'gem-rows', projectHash: 'hash', startTime: '2026-07-20T10:00:00Z', lastUpdated: '2026-07-20T10:00:09Z' },
+    { id: 'row-1', timestamp: '2026-07-20T10:00:01Z', type: 'gemini', content: [{ text: 'bad thoughts' }], thoughts: 'nope' },
+    { id: 'row-2', timestamp: '2026-07-20T10:00:02Z', type: 'gemini', content: [{ text: 'bad calls' }], toolCalls: {} },
+    { id: 'row-3', timestamp: '2026-07-20T10:00:03Z', type: 'gemini', content: [{ text: 'bad entry' }], toolCalls: [null] },
+    { id: 'row-4', timestamp: '2026-07-20T10:00:04Z', type: 'user', content: [{ text: 'dropped by rewind' }] },
+    { $rewindTo: 'row-4' },
+    { id: 'row-5', timestamp: '2026-07-20T10:00:05Z', type: 'user', content: [{ text: 'still here' }] },
+  ]);
+  const { sessions, diagnostics } = parseGeminiFile(file);
+  assert.equal(diagnostics.rowErrors, 3);
+  assert.deepEqual(
+    sessions[0].events.map((event) => [event.kind, event.text]),
+    [['user', 'still here']],
+  );
+});
+
+test('gemini stream records errors, failed results, and flat stats usage', (t) => {
+  const file = fixture(t, 'gemini-stream.jsonl', [
+    { type: 'init', session_id: '11111111-2222-4333-8444-555555555555', model: 'gemini-3.1-pro-preview', timestamp: '2026-07-20T10:00:00Z' },
+    { type: 'message', role: 'user', content: 'Stream question', timestamp: '2026-07-20T10:00:01Z' },
+    { type: 'message', role: 'assistant', delta: true, content: 'Par', timestamp: '2026-07-20T10:00:02Z' },
+    { type: 'message', role: 'assistant', delta: true, content: 'tial', timestamp: '2026-07-20T10:00:02Z' },
+    { type: 'tool_use', tool_id: 'tool-1', tool_name: 'run_shell_command', parameters: { command: 'ls' }, timestamp: '2026-07-20T10:00:03Z' },
+    { type: 'tool_result', tool_id: 'tool-1', status: 'error', error: { message: 'exit 1' }, timestamp: '2026-07-20T10:00:04Z' },
+    { type: 'error', severity: 'error', message: 'stream failed', timestamp: '2026-07-20T10:00:05Z' },
+    { type: 'result', status: 'error', stats: { input_tokens: 12, output_tokens: 4, cached: 2 }, timestamp: '2026-07-20T10:00:06Z' },
+  ]);
+  const { sessions } = parseGeminiFile(file);
+  const session = sessions[0];
+  assert.equal(session.stats.errors, 3);
+  assert.equal(session.usage.length, 1);
+  assert.equal(session.usage[0].model, 'gemini-3.1-pro-preview');
+  assert.equal(session.usage[0].input, 12);
+  assert.equal(session.usage[0].cacheRead, 2);
+  assert.ok(session.events.some((event) => event.kind === 'assistant' && event.text === 'Partial'));
+  assert.ok(session.events.some((event) => event.kind === 'tool' && event.tool.isError));
+  assert.ok(session.events.some((event) => event.kind === 'meta' && event.text === 'stream failed'));
+});
+
+test('api-log chat completions attach trailing tool results and output_text', (t) => {
+  const file = fixture(t, 'api-chat.jsonl', [
+    { provider: 'openai', timestamp: '2026-07-20T10:00:00Z', session_id: 'chat-1', request: { model: 'gpt-5.3-codex', messages: [{ role: 'user', content: 'Fix the bug' }] }, response: { model: 'gpt-5.3-codex', choices: [{ message: { content: 'Patched', reasoning_content: 'null check', tool_calls: [{ id: 'chat-call-1', function: { name: 'apply_patch', arguments: '{"path":"a.js"}' } }] } }], usage: { prompt_tokens: 10, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 4 } } } },
+    { provider: 'openai', timestamp: '2026-07-20T10:00:10Z', session_id: 'chat-1', request: { model: 'gpt-5.3-codex', messages: [{ role: 'user', content: 'Fix the bug' }, { role: 'assistant', tool_calls: [{ id: 'chat-call-1', function: { name: 'apply_patch' } }] }, { role: 'tool', tool_call_id: 'chat-call-1', content: 'patch ok' }] }, response: { model: 'gpt-5.3-codex', output_text: 'All done', usage: { input_tokens: 3, output_tokens: 2 } } },
+  ]);
+  const { sessions } = parseApiLogFile(file);
+  assert.equal(sessions.length, 1);
+  const events = sessions[0].events;
+  assert.ok(events.some((event) => event.kind === 'thinking' && event.text === 'null check'));
+  const tool = events.find((event) => event.kind === 'tool');
+  assert.equal(tool.tool.name, 'apply_patch');
+  assert.equal(tool.tool.result, 'patch ok');
+  assert.ok(events.some((event) => event.kind === 'assistant' && event.text === 'All done'));
+});
+
+test('api-log anthropic rows capture thinking, server tools, and tool results', (t) => {
+  const file = fixture(t, 'api-anthropic.jsonl', [
+    { provider: 'anthropic', timestamp: '2026-07-20T10:01:00Z', session_id: 'anthropic-blocks', request: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'Search please' }] }, response: { model: 'claude-sonnet-4-6', content: [
+      { type: 'thinking', thinking: 'need the web' },
+      { type: 'server_tool_use', id: 'server-1', name: 'web_search' },
+      { type: 'web_search_tool_result', tool_use_id: 'server-1', content: 'found docs' },
+      { type: 'text', text: 'Here you go' },
+    ], usage: { input_tokens: 8, output_tokens: 3 } } },
+  ]);
+  const { sessions } = parseApiLogFile(file);
+  const events = sessions[0].events;
+  assert.ok(events.some((event) => event.kind === 'thinking' && event.text === 'need the web'));
+  const tool = events.find((event) => event.kind === 'tool');
+  assert.equal(tool.tool.name, 'web_search');
+  assert.equal(tool.tool.result, 'found docs');
+  assert.ok(events.some((event) => event.kind === 'assistant' && event.text === 'Here you go'));
+});
+
+test('codex rollouts decode outputs, usage deltas, and payload errors', (t) => {
+  const file = fixture(t, 'rollout-2026-07-20T10-00-00-99999999-9999-4999-8999-999999999999.jsonl', [
+    { timestamp: '2026-07-20T10:00:00Z', type: 'session_meta', payload: { id: '99999999-9999-4999-8999-999999999999', cwd: '/workspace/proj', timestamp: '2026-07-20T10:00:00Z' } },
+    { timestamp: '2026-07-20T10:00:01Z', type: 'turn_context', payload: { model: 'gpt-5.3-codex' } },
+    { timestamp: '2026-07-20T10:00:02Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ text: 'Run the build' }] } },
+    { timestamp: '2026-07-20T10:00:03Z', type: 'response_item', payload: { type: 'reasoning', summary: [{ text: 'check the exit code' }] } },
+    { timestamp: '2026-07-20T10:00:04Z', type: 'response_item', payload: { type: 'function_call', call_id: 'fc-1', name: 'shell', arguments: '{"cmd":"make"}' } },
+    { timestamp: '2026-07-20T10:00:05Z', type: 'response_item', payload: { type: 'function_call_output', call_id: 'fc-1', output: '{"exit_code":2,"output":"boom"}' } },
+    { timestamp: '2026-07-20T10:00:06Z', type: 'response_item', payload: { type: 'function_call', call_id: 'fc-2', name: 'shell', arguments: 'not json' } },
+    { timestamp: '2026-07-20T10:00:07Z', type: 'response_item', payload: { type: 'function_call_output', call_id: 'fc-2', output: 'process exited with code 3' } },
+    { timestamp: '2026-07-20T10:00:08Z', type: 'response_item', payload: { type: 'web_search_call', id: 'ws-1', action: { query: 'docs' } } },
+    { timestamp: '2026-07-20T10:00:09Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 10, output_tokens: 5, cached_input_tokens: 2, cache_creation_input_tokens: 0 } } } },
+    { timestamp: '2026-07-20T10:00:10Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 16, output_tokens: 8, cached_input_tokens: 2, cache_creation_input_tokens: 0 } } } },
+    { timestamp: '2026-07-20T10:00:11Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 4, output_tokens: 1, cached_input_tokens: 0, cache_creation_input_tokens: 0 } } } },
+    { timestamp: '2026-07-20T10:00:12Z', type: 'compacted' },
+    { timestamp: '2026-07-20T10:00:13Z', payload: 'bad' },
+  ]);
+  const { sessions, diagnostics } = parseCodexFile(file);
+  const session = sessions[0];
+  assert.equal(diagnostics.rowErrors, 1);
+  assert.equal(session.id, '99999999-9999-4999-8999-999999999999');
+  assert.equal(session.agent, 'proj');
+  assert.ok(session.events.some((event) => event.kind === 'thinking' && event.text === 'check the exit code'));
+  const tools = session.events.filter((event) => event.kind === 'tool');
+  assert.deepEqual(
+    tools.map((event) => [event.tool.name, event.tool.isError, event.tool.result]),
+    [
+      ['shell', true, 'boom'],
+      ['shell', true, 'process exited with code 3'],
+      ['web_search', false, null],
+    ],
+  );
+  assert.deepEqual(
+    session.usage.map((entry) => [entry.input, entry.output, entry.cacheRead]),
+    [[10, 5, 2], [6, 3, 0], [4, 1, 0]],
+  );
+  assert.ok(session.events.some((event) => event.kind === 'meta' && event.text === 'context compacted'));
+});
+
+test('api-log rows with errors or failing status codes record meta events', (t) => {
+  const file = fixture(t, 'api-errors.jsonl', [
+    { provider: 'openai', timestamp: '2026-07-20T10:00:00Z', session_id: 'err-1', request: { model: 'gpt-5.3-codex', input: 'first' }, error: { message: 'rate limited' }, response: { model: 'gpt-5.3-codex' } },
+    { provider: 'openai', timestamp: '2026-07-20T10:00:05Z', session_id: 'err-1', request: { model: 'gpt-5.3-codex', input: 'second' }, status_code: '503', response: { model: 'gpt-5.3-codex' } },
+  ]);
+  const { sessions } = parseApiLogFile(file);
+  const session = sessions[0];
+  assert.equal(session.stats.errors, 2);
+  const meta = session.events.filter((event) => event.kind === 'meta').map((event) => event.text);
+  assert.deepEqual(meta, ['rate limited', 'API request failed (503)']);
+});
+
+test('api-log anthropic trailing user turns attach late tool results', (t) => {
+  const file = fixture(t, 'api-anthropic-late.jsonl', [
+    { provider: 'anthropic', timestamp: '2026-07-20T10:00:00Z', session_id: 'late-1', request: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'Use the tool' }] }, response: { model: 'claude-sonnet-4-6', content: [{ type: 'tool_use', id: 'call-a', name: 'calculator', input: { op: 'sum' } }], usage: { input_tokens: 5, output_tokens: 2 } } },
+    { provider: 'anthropic', timestamp: '2026-07-20T10:00:10Z', session_id: 'late-1', request: { model: 'claude-sonnet-4-6', messages: [
+      { role: 'user', content: 'Use the tool' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'call-a', name: 'calculator', input: { op: 'sum' } }] },
+      { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'call-a', content: 'tool said 42', is_error: false },
+        { type: 'text', text: 'next please' },
+      ] },
+    ] }, response: { model: 'claude-sonnet-4-6', content: [{ type: 'text', text: 'The answer is 42' }], usage: { input_tokens: 6, output_tokens: 2 } } },
+  ]);
+  const { sessions } = parseApiLogFile(file);
+  const session = sessions[0];
+  const tool = session.events.find((event) => event.kind === 'tool');
+  assert.equal(tool.tool.result, 'tool said 42');
+  assert.ok(session.events.some((event) => event.kind === 'user' && event.text === 'next please'));
+  assert.ok(session.events.some((event) => event.kind === 'assistant' && event.text === 'The answer is 42'));
+});

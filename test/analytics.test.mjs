@@ -1089,3 +1089,27 @@ test('pricing validation rejects malformed aliases and future model versions rem
     assert.equal(priceSession(makeSession({ source: 'claude-code', model }), pricing).total, null);
   }
 });
+
+test('parsePatch marks binary payloads as zero-line estimates', () => {
+  const gitBinary = parsePatch([
+    'diff --git a/img.png b/img.png',
+    'GIT binary patch',
+    'literal 10',
+  ].join('\n'));
+  assert.deepEqual(gitBinary, [
+    { path: 'img.png', additions: 0, deletions: 0, estimated: true },
+  ]);
+
+  const plainBinary = parsePatch([
+    'diff --git a/photo.jpg b/photo.jpg',
+    'Binary files a/photo.jpg and b/photo.jpg differ',
+  ].join('\n'));
+  assert.deepEqual(plainBinary, [
+    { path: 'photo.jpg', additions: 0, deletions: 0, estimated: true },
+  ]);
+
+  const binaryDelete = parsePatch('Binary files a/gone.png and /dev/null differ');
+  assert.deepEqual(binaryDelete, [
+    { path: 'gone.png', additions: 0, deletions: 0, estimated: true },
+  ]);
+});
