@@ -63,6 +63,14 @@ correctness, or code authorship.
 Requirements: Node.js 22 or 24 LTS. Node.js 26 is tested for forward
 compatibility. RunLume has no runtime dependencies and no build step.
 
+Run the published package directly:
+
+```bash
+npx runlume
+```
+
+Or clone the repository, which also provides the synthetic sample:
+
 ```bash
 git clone https://github.com/mlvpatel/RunLume.git
 cd RunLume
