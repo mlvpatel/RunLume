@@ -109,6 +109,74 @@ server and its `HttpOnly` session cookie.
 5. **Render.** A localhost server delivers the accessible HTML, CSS, SVG charts,
    and JavaScript dashboard.
 
+### System context
+
+```mermaid
+C4Context
+  title RunLume system context
+  Person(dev, "Developer", "Reviews cost, code impact, and workflow signals")
+  System(runlume, "RunLume", "Local-first analytics dashboard bound to 127.0.0.1")
+  System_Ext(clis, "AI coding agents", "Claude Code, Cursor, Codex CLI, Gemini CLI, Hermes")
+  SystemDb_Ext(files, "Local transcript files", "JSON and JSONL session state on this machine")
+  Rel(dev, runlume, "Uses", "loopback HTTP")
+  Rel(clis, files, "Write", "during coding sessions")
+  Rel(runlume, files, "Reads", "read-only, bounded")
+```
+
+Everything lives on one machine: the agent CLIs write transcripts as a side
+effect of normal use, and RunLume reads them without modifying anything.
+
+### Data flow
+
+```mermaid
+flowchart LR
+  subgraph disk["Local agent state on disk (read-only)"]
+    direction TB
+    claude["Claude Code<br/>~/.claude/projects"]
+    cursor["Cursor<br/>~/.cursor/projects"]
+    codex["Codex CLI<br/>~/.codex/sessions"]
+    gemini["Gemini CLI<br/>~/.gemini/tmp"]
+    hermes["Hermes<br/>~/.hermes"]
+    imports["Provider logs<br/>--import-dir"]
+  end
+  subgraph proc["RunLume process — zero runtime dependencies"]
+    direction LR
+    adapters["adapters.mjs<br/>discover + normalize"]
+    analytics["analytics.mjs<br/>price · impact · workflow"]
+    server["server.mjs<br/>bounds · redaction · auth"]
+    adapters --> analytics --> server
+  end
+  browser["Dashboard<br/>public/ HTML, CSS, SVG, JS"]
+  disk --> adapters
+  server -->|"127.0.0.1 only<br/>HttpOnly capability cookie"| browser
+```
+
+### Request lifecycle
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant B as Browser
+  participant R as RunLume server (127.0.0.1:4477 by default)
+  Note over R: launch: API token = 32 random bytes (base64url)
+  B->>R: GET / (document navigation)
+  R->>R: validate Host and Origin
+  R-->>B: dashboard + Set-Cookie: HttpOnly, SameSite=Strict
+  Note over B,R: cookie = HMAC-SHA256(key = token, msg = "runlume-browser-session-v1")
+  B->>R: GET /api/dashboard (cookie attached by the browser)
+  R->>R: constant-time capability check
+  R-->>B: redacted JSON (identifiers and transcript text replaced)
+  B->>R: GET /api/session?view=raw (explicit reveal)
+  R-->>B: one trajectory with sensitive content revealed
+```
+
+The cookie capability is a one-way HMAC derivation, so possessing the cookie
+never recovers the raw API token, and both credentials are compared in
+constant time. Direct API clients may present the Bearer token instead.
+
+Mermaid diagrams render on GitHub; the npm page shows their source, while the
+SVG overview above renders everywhere.
+
 The full [architecture guide](https://github.com/mlvpatel/RunLume/blob/main/docs/architecture.md) explains trust boundaries,
 data flow, caching, metric logic, and extension points.
 
@@ -150,6 +218,61 @@ not endorsed by those vendors.
 Unknown models stay visibly unpriced. Whole-file writes and incomplete delete
 payloads are marked as estimates. See the [reference guide](https://github.com/mlvpatel/RunLume/blob/main/docs/reference.md)
 for formulas, command-line options, environment variables, imports, and limits.
+
+### The mathematics
+
+**API-equivalent cost.** Adapters normalize every usage entry so its input
+count $I$ is the total prompt — fresh input plus cache reads plus cache
+writes — and $O$ is the output count. The entry is decomposed with clamps so
+no part can exceed the whole:
+
+$$C = \min(I,\ \text{cacheRead}), \qquad W = \min(I - C,\ \text{cacheWrite})$$
+
+$$W_{5m} = \min(W,\ \text{cacheWrite}_{5m}), \qquad W_{1h} = \min(W - W_{5m},\ \text{cacheWrite}_{1h}), \qquad W_{u} = W - W_{5m} - W_{1h}$$
+
+$$I_{\text{fresh}} = I - C - W$$
+
+With a dated rate row $r$ (USD per million tokens) matched to the entry's
+model, source, and timestamp, the entry cost is
+
+$$\text{cost} = \frac{I_{\text{fresh}}\, r_{\text{in}} + C\, r_{\text{read}} + W_{u}\, r_{\text{write}} + W_{5m}\, r_{5m} + W_{1h}\, r_{1h} + O\, r_{\text{out}}}{10^{6}}$$
+
+A missing cache-write tier rate falls back to the other cache-write rates,
+then the input rate. Entries with no matching rate — and every explicit local
+runtime — contribute null, never a guess. A session's cost sums its priced
+entries, and pricing coverage compares priced to total billable tokens, where
+billable is $I + O$.
+
+**Parsed code impact.** Each confirmed edit payload is reduced by stripping
+the common line prefix and suffix. For the remaining $b$ old lines and $a$
+new lines, a single-row dynamic program computes the longest common
+subsequence length $L$, giving
+
+$$\text{additions} = |a| - L, \qquad \text{deletions} = |b| - L$$
+
+When $|b| \cdot |a| > 250{,}000$ cells, the exact program is skipped and the
+block counts as $|a|$ additions and $|b|$ deletions, marked estimated — as
+are whole-file writes and incomplete delete payloads.
+
+**Workflow signals.** Rework counts repeat edits inside one session, while
+churn and risk aggregate across sessions. With $e_f$ confirmed edits to file
+$f$, $s_f$ distinct sessions touching it, and $\Delta_f$ its changed lines
+(additions plus deletions):
+
+$$\text{rework} = \sum_{f} \max(0,\ e_f - 1), \qquad \text{churn}_f = \max(0,\ s_f - 1) + \max(0,\ e_f - s_f)$$
+
+$$\text{risk}_f = \operatorname{round}\left(\min\left(100,\ 35\min\left(1, \tfrac{s_f}{4}\right) + 25\min\left(1, \tfrac{e_f}{8}\right) + 25\min\left(1, \tfrac{\text{churn}_f}{6}\right) + 15\min\left(1, \tfrac{\Delta_f}{500}\right)\right)\right)$$
+
+Comparison ratios divide observed sums:
+
+$$\text{cache efficiency} = \frac{\text{cache-read tokens}}{\text{total input tokens}}, \qquad \text{tool error rate} = \frac{\text{tool errors}}{\text{tool calls}}, \qquad \text{cost per 100 lines} = \frac{100 \cdot \text{priced cost}}{\text{priced changed lines}}$$
+
+Durations — tool latency (result time minus call time) and time to first
+edit (first confirmed edit minus first user event) — are admitted only when
+$0 \le \Delta t < 24\ \text{h}$; aggregates use the median, averaging the two
+central values for even counts. Every ratio reports null instead of a
+fabricated zero when its denominator is empty, and token sums are clamped to
+JavaScript's safe-integer range.
 
 ## Privacy and security
 
