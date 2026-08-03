@@ -6,7 +6,9 @@
   "files": [
     "server.mjs",
     "adapters.mjs",
+    "adapters/",
     "analytics.mjs",
+    "analytics/",
     "pricing.json",
     "public/",
     "sample/",
@@ -21,7 +23,7 @@
   "scripts": {
     "start": "node server.mjs",
     "sample": "node sample/generate.mjs && node server.mjs --import-dir ./sample-data --sources api-log --all",
-    "check": "node --check server.mjs && node --check adapters.mjs && node --check analytics.mjs && node --check public/app.js && node --check scripts/capture-demo.mjs && node --check scripts/generate-sbom.mjs && node --check scripts/package-smoke.mjs && node --check test/e2e/dashboard.e2e.mjs",
+    "check": "node --check server.mjs && node --check adapters.mjs && node --check analytics.mjs && node scripts/check-modules.mjs && node --check public/app.js && node --check scripts/capture-demo.mjs && node --check scripts/generate-sbom.mjs && node --check scripts/package-smoke.mjs && node --check test/e2e/dashboard.e2e.mjs",
     "test": "node --test test/adapters.test.mjs test/analytics.test.mjs test/server.test.mjs",
     "test:e2e": "node --test test/e2e/dashboard.e2e.mjs",
     "test:package": "node scripts/package-smoke.mjs",

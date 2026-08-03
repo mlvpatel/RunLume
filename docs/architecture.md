@@ -10,7 +10,8 @@ between processes or accounts on the same machine.
 
 ### 1. Discovery
 
-`adapters.mjs` resolves supported state roots and finds transcript files.
+`adapters.mjs` re-exports one module per agent CLI from `adapters/`; each
+resolves its supported state roots and finds transcript files.
 Discovery is source-specific, read-only, depth-limited where applicable, and
 bounded by file count and aggregate bytes. Symbolic links are rejected.
 
@@ -39,7 +40,8 @@ analysis.
 
 ### 3. Analysis
 
-`analytics.mjs` runs deterministic calculations over normalized sessions:
+`analytics.mjs` re-exports the per-concern modules in `analytics/`, which run
+deterministic calculations over normalized sessions:
 
 - dated model pricing with visible coverage;
 - successful edit extraction and bounded line diffs;
@@ -105,7 +107,8 @@ database and writes nothing into agent state directories.
 
 To add a source:
 
-1. implement discovery and parsing in `adapters.mjs`;
+1. implement discovery and parsing in a new module under `adapters/`,
+   re-exported from `adapters.mjs`;
 2. return normalized sessions and diagnostics;
 3. register the adapter in `makeAdapters()`;
 4. add synthetic fixtures for every accepted event shape;
