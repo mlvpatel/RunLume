@@ -997,3 +997,45 @@ test('session API applies the requested source before key lookup', async (t) => 
   );
   assert.equal(matched.status, 200);
 });
+
+test('configuration rejects out-of-range and unknown options', () => {
+  assert.throws(() => parseConfig(['--port', '70000']), /invalid port/);
+  assert.throws(() => parseConfig(['--bogus']), /unknown option/);
+  assert.throws(() => parseConfig(['--days', '0']), /invalid day window/);
+  assert.throws(() => createDashboard({ config: { days: 0 } }), /requires days/);
+});
+
+test('session endpoint rejects invalid pagination and view parameters', async (t) => {
+  const root = stateDir(t);
+  const sessionId = '77777777-7777-4777-8777-777777777777';
+  writeSession(root, 'main', sessionId, [
+    { type: 'session', id: sessionId, timestamp: '2026-07-20T10:00:00Z' },
+    { type: 'message', timestamp: '2026-07-20T10:00:01Z', message: { role: 'user', content: 'Hello there' } },
+  ]);
+  const dashboard = createDashboard({ config: config(root), logger: quietLogger });
+  await new Promise((resolve, reject) => {
+    dashboard.server.once('error', reject);
+    dashboard.server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => dashboard.server.close());
+  const port = dashboard.server.address().port;
+  const headers = { Authorization: `Bearer ${dashboard.apiToken}` };
+  const key = (await (await fetch(`http://127.0.0.1:${port}/api/dashboard`, { headers })).json())
+    .sessions[0].key;
+
+  const badOffset = await fetch(
+    `http://127.0.0.1:${port}/api/session?key=${encodeURIComponent(key)}&offset=abc`,
+    { headers },
+  );
+  assert.equal(badOffset.status, 400);
+  const badView = await fetch(
+    `http://127.0.0.1:${port}/api/session?key=${encodeURIComponent(key)}&view=full`,
+    { headers },
+  );
+  assert.equal(badView.status, 400);
+  const missing = await fetch(
+    `http://127.0.0.1:${port}/api/session?id=00000000-0000-4000-8000-000000000000`,
+    { headers },
+  );
+  assert.equal(missing.status, 404);
+});
