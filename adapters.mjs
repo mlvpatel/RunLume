@@ -10,13 +10,6 @@ import { cursorAdapter } from './adapters/cursor.mjs';
 import { geminiAdapter } from './adapters/gemini.mjs';
 import { apiLogAdapter } from './adapters/imports.mjs';
 import { hermesAdapter } from './adapters/hermes.mjs';
-export * from './adapters/shared.mjs';
-export * from './adapters/claude.mjs';
-export * from './adapters/codex.mjs';
-export * from './adapters/cursor.mjs';
-export * from './adapters/gemini.mjs';
-export * from './adapters/imports.mjs';
-export * from './adapters/hermes.mjs';
 export function makeAdapters({
   hermesDir = null,
   importDir = null,
@@ -36,3 +29,28 @@ export function makeAdapters({
   ];
   return sources ? all.filter((a) => sources.includes(a.source)) : all;
 }
+
+export {
+  parseClaudeCodeFile,
+} from './adapters/claude.mjs';
+export {
+  parseCodexFile,
+} from './adapters/codex.mjs';
+export {
+  parseCursorFile,
+} from './adapters/cursor.mjs';
+export {
+  parseGeminiFile,
+} from './adapters/gemini.mjs';
+export {
+  parseApiLogFile,
+} from './adapters/imports.mjs';
+export {
+  UUID_RE,
+  isInjectedMetadataText,
+  newSession,
+  parseGenericAgentFile,
+  readJsonDocument,
+  readJsonLines,
+} from './adapters/shared.mjs';
+

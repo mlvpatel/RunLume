@@ -1,26 +1,5 @@
 import path from 'node:path';
 import {
-  FUTURE_TIMESTAMP_TOLERANCE_MS,
-  EDIT_TOOLS,
-  dayKey,
-  calendarWindowStart,
-  inferProvider,
-  MAX_ANALYTICS_PATH_LENGTH,
-  GIT_PATCH_PATH,
-  CORRECTION_RE,
-  analyticsTimestampMs,
-  timestampIsAfter,
-  tokenCount,
-  tokenSum,
-  PROVIDER_ALIASES,
-  lineCount,
-  canonicalProjectPath,
-  isCaseInsensitiveProjectPath,
-  cleanFilePath,
-  decodeGitQuotedPath,
-  patchHeaderPath,
-  gitDiffPaths,
-  sessionProject,
   linesOf,
 } from './shared.mjs';
 export function diffLineCounts(oldValue, newValue) {
@@ -238,7 +217,7 @@ function hasLocalApplyPatchDeclaration(source) {
   return /^\s*(?:(?:export\s+)?(?:async\s+)?function|def)\s+apply_patch\s*\(/m.test(code)
     || /^\s*apply_patch\s*\([^)]*\)\s*(?:\{|:)/m.test(code)
     || /\b(?:const|let|var)\s+apply_patch\s*=/m.test(code)
-    || /\bimport\s+[^;\n]*\bapply_patch\b/m.test(code);
+    || /\bimport\s[^;\n]*\bapply_patch\b/m.test(code);
 }
 
 function shellTokens(source) {
@@ -697,24 +676,6 @@ function wrappedPatchTexts(name, args) {
 /** Parse Codex apply_patch and ordinary unified diff bodies into per-file deltas. */
 export {
   PATCH_WRAPPER_TOOLS,
-  MAX_PATCH_WRAPPER_SOURCE_LENGTH,
-  MAX_PATCH_INVOCATIONS,
-  looksLikePatch,
   directPatchText,
-  executableText,
-  hasLocalApplyPatchDeclaration,
-  shellTokens,
-  heredocBody,
-  shellCommandInfo,
-  collectShellPatches,
-  decodeStaticString,
-  lexicalScopes,
-  scopeAt,
-  bindingEntryBefore,
-  bindingBefore,
-  staticAssignments,
-  staticInvocationArgument,
-  patchBudget,
-  collectJavaScriptPatches,
   wrappedPatchTexts,
 };

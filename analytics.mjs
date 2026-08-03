@@ -3,9 +3,30 @@
  * shared primitives, line-diff impact, patch extraction, pricing,
  * per-session workflow intelligence, and cross-session statistics.
  */
-export * from './analytics/shared.mjs';
-export * from './analytics/impact.mjs';
-export * from './analytics/patch.mjs';
-export * from './analytics/pricing.mjs';
-export * from './analytics/workflow.mjs';
-export * from './analytics/stats.mjs';
+
+export {
+  diffLineCounts,
+} from './analytics/impact.mjs';
+export {
+  extractEditOperations,
+  parsePatch,
+} from './analytics/patch.mjs';
+export {
+  priceSession,
+  validatePricing,
+} from './analytics/pricing.mjs';
+export {
+  EDIT_TOOLS,
+  FUTURE_TIMESTAMP_TOLERANCE_MS,
+  calendarWindowStart,
+  dayKey,
+  inferProvider,
+} from './analytics/shared.mjs';
+export {
+  buildStats,
+  sessionSummary,
+} from './analytics/stats.mjs';
+export {
+  sessionIntelligence,
+} from './analytics/workflow.mjs';
+

@@ -3,44 +3,16 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import {
-  UUID_RE,
   newSession,
-  isInjectedMetadataText,
   readJsonLines,
-  readJsonDocument,
-  parseGenericAgentFile,
   SPAWN_TOOL_RE,
-  DEFAULT_MAX_TRANSCRIPT_BYTES,
-  MAX_SESSION_ID_LENGTH,
-  MAX_TOOL_NAME_LENGTH,
-  MAX_MODEL_NAME_LENGTH,
-  INJECTED_METADATA_TAGS,
   maxTranscriptBytes,
-  tokenCount,
-  tokenSum,
-  boundedIdentifier,
   normalizedTimestamp,
-  firstText,
-  assignSessionModel,
-  blocksOf,
-  textOf,
-  assignSessionId,
-  normalizedUsage,
-  recordUsage,
-  appendUsage,
-  readDiagnostics,
-  openTranscript,
-  nestedUuids,
-  addToolCall,
-  attachResult,
   touch,
   finalizeLabel,
-  isLexicallyWithin,
   safeReaddir,
   safeChildPath,
   walkJsonl,
-  walkJsonTranscripts,
-  fileModifiedTimestamp,
   parseGenericMessage,
 } from './shared.mjs';
 // ── Claude Code (~/.claude/projects/<munged-cwd>/<sessionId>.jsonl) ──────────
@@ -193,7 +165,5 @@ function claudeCodeAdapter(maxBytes) {
 }
 
 export {
-  CC_SKIP_TYPES,
-  ccParseMessageInto,
   claudeCodeAdapter,
 };
