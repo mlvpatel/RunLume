@@ -124,11 +124,12 @@ C4Context
   title RunLume system context
   Person(dev, "Developer", "Reviews cost, code impact, and workflow signals")
   System(runlume, "RunLume", "Local-first analytics dashboard bound to 127.0.0.1")
-  System_Ext(clis, "AI coding agents", "Claude Code, Cursor, Codex CLI, Gemini CLI, Hermes")
   SystemDb_Ext(files, "Local transcript files", "JSON and JSONL session state on this machine")
+  System_Ext(clis, "AI coding agents", "Claude Code, Cursor, Codex CLI, Gemini CLI, Hermes")
   Rel(dev, runlume, "Uses", "loopback HTTP")
-  Rel(clis, files, "Write", "during coding sessions")
   Rel(runlume, files, "Reads", "read-only, bounded")
+  Rel(clis, files, "Write", "during coding sessions")
+  UpdateLayoutConfig($c4ShapeInRow="2", $c4BoundaryInRow="1")
 ```
 
 Everything lives on one machine: the agent CLIs write transcripts as a side
