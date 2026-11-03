@@ -681,7 +681,6 @@ function wrappedPatchTexts(name, args) {
   return budget.patches;
 }
 
-/** Parse Codex apply_patch and ordinary unified diff bodies into per-file deltas. */
 export {
   PATCH_WRAPPER_TOOLS,
   directPatchText,
