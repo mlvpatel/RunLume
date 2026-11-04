@@ -1,4 +1,3 @@
-import path from 'node:path';
 import {
   EDIT_TOOLS,
   GIT_PATCH_PATH,
@@ -13,6 +12,7 @@ import {
   directPatchText,
   wrappedPatchTexts,
 } from './impact.mjs';
+/** Parse Codex apply_patch and ordinary unified diff bodies into per-file deltas. */
 export function parsePatch(patch) {
   if (typeof patch !== 'string' || !patch) return [];
   const records = new Map();
@@ -227,77 +227,3 @@ export function extractEditOperations(ev, cwd = null) {
   }
   return stringEdit(p, args.old_string ?? args.old_str ?? '', args.new_string ?? args.new_str ?? args.content ?? '', cwd);
 }
-
-function validIsoDay(value) {
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
-  const date = new Date(`${value}T00:00:00Z`);
-  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
-}
-
-function effectiveInterval(rate, pricing) {
-  const from = rate.effectiveFrom ?? pricing.effectiveFrom;
-  const to = rate.effectiveTo ?? pricing.effectiveTo;
-  if ((from && !validIsoDay(from)) || (to && !validIsoDay(to))) return null;
-  return {
-    from: from ? Date.parse(`${from}T00:00:00Z`) : Number.NEGATIVE_INFINITY,
-    to: to ? Date.parse(`${to}T00:00:00Z`) : Number.POSITIVE_INFINITY,
-  };
-}
-
-function findIntervalOverlap(intervals) {
-  const ordered = [...intervals].sort((a, b) => a.from - b.from || b.to - a.to);
-  let active = null;
-  for (const current of ordered) {
-    if (active && current.index !== active.index && current.from < active.to) {
-      return [active, current];
-    }
-    if (!active || current.to > active.to) active = current;
-  }
-  return null;
-}
-
-function pricingOverlapIssues(intervals) {
-  const byAlias = new Map();
-  for (const interval of intervals) {
-    const group = byAlias.get(interval.alias) ?? [];
-    group.push(interval);
-    byAlias.set(interval.alias, group);
-  }
-
-  const candidateGroups = new Map(byAlias);
-  for (const [alias, group] of byAlias) {
-    const dated = /^(.*)-(?:\d{8}|\d{4}-\d{2}-\d{2})$/.exec(alias);
-    if (!dated) continue;
-    const suffixDate = alias.slice(dated[1].length + 1);
-    if (!(/^\d{8}$/.test(suffixDate) || validIsoDay(suffixDate))) continue;
-    const datedBaseRows = (byAlias.get(dated[1]) ?? []).filter((row) => row.allowDatedSuffix);
-    if (datedBaseRows.length) candidateGroups.set(alias, [...group, ...datedBaseRows]);
-  }
-
-  const issues = [];
-  const reported = new Set();
-  for (const [alias, group] of candidateGroups) {
-    const globals = group.filter((row) => !row.source);
-    const scopes = new Set(group.map((row) => row.source).filter(Boolean));
-    const scopedGroups = scopes.size
-      ? [...scopes].map((source) => [...globals, ...group.filter((row) => row.source === source)])
-      : [globals];
-    for (const scoped of scopedGroups) {
-      const overlap = findIntervalOverlap(scoped);
-      if (!overlap) continue;
-      const [left, right] = overlap;
-      const pair = [left.index, right.index].sort((a, b) => a - b);
-      const key = `${pair[0]}:${pair[1]}:${alias}`;
-      if (reported.has(key)) continue;
-      reported.add(key);
-      issues.push(`models[${pair[0]}] overlaps models[${pair[1]}] for model ${alias}`);
-    }
-  }
-  return issues;
-}
-
-export {
-  effectiveInterval,
-  pricingOverlapIssues,
-  validIsoDay,
-};

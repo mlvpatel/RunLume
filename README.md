@@ -66,7 +66,7 @@ compatibility. RunLume has no runtime dependencies and no build step.
 Run the published package directly:
 
 ```bash
-npx -y runlume@0.3.3
+npx -y runlume@0.3.4
 ```
 
 Or clone the repository, which also provides the synthetic sample:
@@ -351,7 +351,7 @@ a GitHub release containing the exact npm tarball, CycloneDX SBOM, and
 the release package; verify them with:
 
 ```bash
-gh attestation verify runlume-v0.3.3.tgz --repo mlvpatel/RunLume
+gh attestation verify runlume-v0.3.4.tgz --repo mlvpatel/RunLume
 shasum -a 256 -c SHA256SUMS
 ```
 
