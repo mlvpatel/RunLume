@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.4 - 2026-11-04
+
+- Fixed quadratic-time regular expressions in apply_patch declaration
+  detection. A crafted `exec` tool input in any scanned transcript could stall
+  a dashboard scan for hours; every hostile input shape now finishes in under
+  a second at the 4 MiB wrapper limit. Declarations whose parameter list or
+  import clause exceeds 256 characters before `apply_patch` are no longer
+  detected.
+- Split the adapters and analytics into per-source and per-concern modules
+  behind unchanged entry points, with an 800-line module budget enforced by
+  `npm run check`.
+- Raised branch coverage above 80% with tests for previously untested parser,
+  pricing, and server paths, including the declaration-shadowing rules.
+- Added a governance and continuity policy, an `npx` quick start, and
+  architecture diagrams with the metric formulas to the documentation.
+
 ## 0.3.3 - 2026-08-03
 
 - Routed private conduct reports through the repository's private reporting

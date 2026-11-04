@@ -216,12 +216,16 @@ function executableText(source) {
   return output;
 }
 
+// Each pattern must stay linear on 4 MiB of hostile transcript text: line
+// anchors skip only horizontal whitespace, and scans that many start positions
+// could share are capped at 256 characters, so longer parameter lists or
+// import clauses before `apply_patch` are not detected as declarations.
 function hasLocalApplyPatchDeclaration(source) {
   const code = executableText(source);
-  return /^\s*(?:(?:export\s+)?(?:async\s+)?function|def)\s+apply_patch\s*\(/m.test(code)
-    || /^\s*apply_patch\s*\([^)]*\)\s*(?:\{|:)/m.test(code)
+  return /^[^\S\n]*(?:(?:export\s+)?(?:async\s+)?function|def)\s+apply_patch\s*\(/m.test(code)
+    || /^[^\S\n]*apply_patch\s*\([^)]{0,256}\)\s*(?:\{|:)/m.test(code)
     || /\b(?:const|let|var)\s+apply_patch\s*=/m.test(code)
-    || /\bimport\s[^;\n]*\bapply_patch\b/m.test(code);
+    || /\bimport(?:\s*\n|[^\S\n])[^;\n]{0,256}\bapply_patch\b/m.test(code);
 }
 
 function shellTokens(source) {
@@ -677,7 +681,6 @@ function wrappedPatchTexts(name, args) {
   return budget.patches;
 }
 
-/** Parse Codex apply_patch and ordinary unified diff bodies into per-file deltas. */
 export {
   PATCH_WRAPPER_TOOLS,
   directPatchText,
