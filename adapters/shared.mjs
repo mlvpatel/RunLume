@@ -12,8 +12,6 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
-import crypto from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 
 export const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
