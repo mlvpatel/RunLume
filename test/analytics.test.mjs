@@ -134,6 +134,56 @@ test('patch parsing requires an edit tool or explicit apply_patch wrapper', () =
   }
 });
 
+test('local apply_patch declarations shadow bare calls but not tools.apply_patch', () => {
+  const patch = `*** Begin Patch
+*** Update File: src/real.js
+@@
+-old
++new
+*** End Patch`;
+  const call = `const patch = ${JSON.stringify(patch)};\napply_patch(patch);`;
+  const edit = [{ path: 'src/real.js', additions: 1, deletions: 1 }];
+  assert.deepEqual(extractEditOperations(tool('exec', { input: call })), edit);
+  for (const declaration of [
+    'function apply_patch(patch) {}',
+    '\n\n  export async function apply_patch(patch) {}',
+    'def apply_patch(patch):\n    return patch',
+    'apply_patch() { :; }',
+    'apply_patch(patch): void {}',
+    'const apply_patch = (patch) => patch;',
+    'import { apply_patch } from "./local.js";',
+    'import \n  apply_patch from "./local.js";',
+    'from local import apply_patch',
+  ]) {
+    assert.deepEqual(
+      extractEditOperations(tool('exec', { input: `${declaration}\n${call}` })),
+      [],
+      declaration,
+    );
+  }
+  const qualified = call.replace('apply_patch(patch);', 'tools.apply_patch(patch);');
+  assert.deepEqual(
+    extractEditOperations(tool('exec', { input: `function apply_patch(patch) {}\n${qualified}` })),
+    edit,
+  );
+});
+
+test('wrapper analysis stays linear on hostile exec input', () => {
+  const size = 256 * 1024;
+  const slow = [];
+  for (const [shape, input] of [
+    ['blank lines', '\n'.repeat(size)],
+    ['repeated imports', 'import '.repeat(Math.floor(size / 7))],
+    ['unclosed calls', 'apply_patch(\n'.repeat(Math.floor(size / 13))],
+  ]) {
+    const started = performance.now();
+    extractEditOperations(tool('exec', { input }));
+    const elapsed = performance.now() - started;
+    if (elapsed >= 1000) slow.push(`${shape}: ${elapsed.toFixed(0)} ms`);
+  }
+  assert.deepEqual(slow, []);
+});
+
 test('wrapped patches are bound to the invoked argument and ignore fixture text', () => {
   const fake = `*** Begin Patch
 *** Update File: fake.js

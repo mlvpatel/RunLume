@@ -1,4 +1,3 @@
-import path from 'node:path';
 import {
   median,
   FUTURE_TIMESTAMP_TOLERANCE_MS,
